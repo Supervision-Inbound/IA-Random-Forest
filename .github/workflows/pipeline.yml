@@ -1,17 +1,18 @@
 name: IA Forecast + Alertas
 
 on:
-  schedule:
-    - cron: "0 6 * * *"   # todos los días 06:00 UTC
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
+  # Descomenta si quieres que se ejecute solo
+  # schedule:
+  #   - cron: "0 6 * * *"
+  # push:
+  #   branches: [ "main" ]
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # para commitear los JSON
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +45,7 @@ jobs:
                -H "Accept: application/octet-stream" \
                "$ASSET_URL" -o models.zip
           unzip -o models.zip -d models
-          ls -lh models
+          echo "Contenido de models/"; find models -maxdepth 3 -type f -name "*.pkl" -ls
 
       - name: Run pipeline
         env:
