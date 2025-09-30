@@ -6,37 +6,44 @@ import numpy as np
 import requests
 import joblib
 from dateutil import parser as dtparser
+from pathlib import Path
 
-# ========= CONFIG (por variables de entorno con defaults razonables) =========
-MODELS_DIR = "models"
-DATA_DIR   = "data"
+# ========== CONFIG BÁSICA ==========
+MODELS_DIR = "models"   # donde se descomprime models.zip (pipeline.yml lo hace)
+DATA_DIR   = "data"     # dataset opcional (el script funciona si no existe)
 OUT_DIR    = "out"
 
-MODEL_PATH   = os.path.join(MODELS_DIR, "modelo_llamadas_rf.pkl")
-ENCODER_PATH = os.path.join(MODELS_DIR, "labelencoder_comunas.pkl")
-DATASET_PATH = os.path.join(DATA_DIR, "dataset_entrenamiento_llamadas.parquet")
+# nombres preferidos de artefactos
+PREFERRED_MODEL_NAME   = "modelo_llamadas_rf.pkl"
+PREFERRED_ENCODER_NAME = "labelencoder_comunas.pkl"
 
-CLIMA_URL   = os.environ.get("CLIMA_URL", "").strip()
-TURNOS_URL  = os.environ.get("TURNOS_URL", "").strip()
+# ========== LECTURA ROBUSTA DE ENV ==========
+def get_float_env(name: str, default: float) -> float:
+    val = os.environ.get(name)
+    try:
+        if val is None or str(val).strip() == "":
+            return default
+        return float(val)
+    except Exception:
+        return default
 
-# Erlang C params (puedes setear por secrets)
-SLA_TARGET   = float(os.environ.get("SLA_TARGET", "0.9"))     # 90%
-ASA_SECONDS  = float(os.environ.get("ASA_SECONDS", "20"))     # 20s
-OCC_MAX      = float(os.environ.get("OCCUPANCY_MAX", "0.85")) # 85%
-SHRINKAGE    = float(os.environ.get("SHRINKAGE", "0.3"))      # 30%
+# Erlang C params (si secrets están vacíos, usamos defaults)
+SLA_TARGET  = get_float_env("SLA_TARGET", 0.9)     # 90%
+ASA_SECONDS = get_float_env("ASA_SECONDS", 20.0)   # 20s
+OCC_MAX     = get_float_env("OCCUPANCY_MAX", 0.85) # 85%
+SHRINKAGE   = get_float_env("SHRINKAGE", 0.3)      # 30%
 
-# Umbrales para alertas climáticas (ajusta a tu realidad)
-MIN_UPLIFT_LLAMADAS = 30        # alerta si el clima agrega ≥30 llamadas/h
-MIN_PRECIP_MM       = 5.0       # lluvia relevante
-MIN_VIENTO_KMH      = 30.0      # viento relevante
+# URLs (pueden venir vacías; el script igual corre con fallbacks)
+CLIMA_URL  = os.environ.get("CLIMA_URL", "").strip()
+TURNOS_URL = os.environ.get("TURNOS_URL", "").strip()
 
-# Horizonte para alertas (horas desde mañana) y forecast mensual (2 meses)
-HORIZON_ALERTAS_H = 24 * 7
-MESES_FORECAST    = 2
+# umbrales de alerta climática
+MIN_UPLIFT_LLAMADAS = 30
+HORIZON_ALERTAS_H   = 24 * 7
+MESES_FORECAST      = 2
 
-# ========= UTILIDADES =========
-def ensure_dir(p):
-    os.makedirs(p, exist_ok=True)
+# ========== UTILIDADES ==========
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def norm_text(s):
     if pd.isna(s): return ""
@@ -57,49 +64,26 @@ def cal_feats(df, fecha_col="fecha"):
     df["es_primavera"] = df["mes"].isin([9,10,11]).astype(int)
     return df
 
-# ========= ERLANG C =========
+# ========== ERLANG C ==========
 def erlang_c_probability(a, n):
-    """
-    a: tráfico en erlangs (arrivals_per_sec * AHT_sec)
-    n: número de agentes
-    """
-    if n <= 0: 
-        return 1.0
+    if n <= 0: return 1.0
     rho = a / n
-    if rho >= 1:
-        return 1.0
-    # fórmula clásica
-    # P(wait) = ( (a^n / n!)*(n/(n-a)) ) / ( sum_{k=0}^{n-1} (a^k / k!) + (a^n / n!)*(n/(n-a)) )
-    # Usamos log para estabilidad numérica
+    if rho >= 1: return 1.0
     from math import lgamma, exp, log
-    # parte superior
     log_num = n*log(a) - lgamma(n+1) + log(n/(n-a))
-    # sumatorio inferior
     s = 0.0
     for k in range(n):
         s += exp(k*log(a) - lgamma(k+1))
     denom = s + exp(log_num)
     return exp(log_num) / denom
 
-def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target, occ_max=0.85, shrinkage=0.3, n_max=1000):
-    """
-    Devuelve agentes requeridos (entero) para cumplir SLA y ocupación,
-    ajustado por shrinkage.
-    """
-    if calls_per_hour < 0: calls_per_hour = 0
-    lam = calls_per_hour / 3600.0   # llegadas por segundo
-    a = lam * aht_sec               # erlangs
-
-    # buscar n mínimo que cumpla:
-    # 1) occupancy = a/n <= occ_max
-    # 2) service level >= sla_target, con ASA target
-    # Service level aproximado con Erlang C:
-    # P(espera <= T) = 1 - P(wait) * exp(-(n - a) * (T / aht))
-    # (T = asa_target_sec)
-    n = max(1, math.ceil(a / occ_max))  # empezar desde ocupación
-    T = asa_target_sec
+def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target, occ_max=0.85, shrinkage=0.3, n_max=2000):
+    calls_per_hour = max(0.0, float(calls_per_hour))
+    lam = calls_per_hour / 3600.0
+    a = lam * max(1.0, float(aht_sec))
+    n = max(1, math.ceil(a / max(0.01, occ_max)))
+    T = max(1.0, float(asa_target_sec))
     best_n = None
-
     while n <= n_max:
         P_wait = erlang_c_probability(a, n)
         if a == 0:
@@ -107,48 +91,70 @@ def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target, occ_max
         else:
             sl = 1.0 - P_wait * math.exp(-(n - a) * (T / aht_sec))
         occ = (a / n) if n > 0 else 1.0
-
         if occ <= occ_max and sl >= sla_target:
             best_n = n
             break
         n += 1
+    if best_n is None: best_n = n
+    return max(1, math.ceil(best_n / (1 - shrinkage)))
 
-    if best_n is None:
-        best_n = n  # lo que haya llegado
+# ========== BUSCAR ARTEFACTOS (.pkl) EN models/ (soporta subcarpetas) ==========
+def find_artifact_paths(models_root: str) -> tuple[str, str]:
+    root = Path(models_root)
+    if not root.exists():
+        raise FileNotFoundError(f"No existe la carpeta de modelos: {models_root}")
+    preferred_model = None
+    preferred_encoder = None
+    for p in root.rglob("*.pkl"):
+        name = p.name.lower()
+        if name == PREFERRED_MODEL_NAME.lower():
+            preferred_model = str(p)
+        if name == PREFERRED_ENCODER_NAME.lower():
+            preferred_encoder = str(p)
+    if preferred_model and preferred_encoder:
+        print(f"[models] Encontrados (preferidos):\n  MODEL  = {preferred_model}\n  ENCODER= {preferred_encoder}")
+        return preferred_model, preferred_encoder
+    all_pkls = list(root.rglob("*.pkl"))
+    if not all_pkls:
+        raise FileNotFoundError("No se encontraron archivos .pkl dentro de 'models/'.")
+    all_pkls_sorted = sorted(all_pkls, key=lambda p: p.stat().st_size, reverse=True)
+    guess_model = str(all_pkls_sorted[0])
+    guess_encoder = None
+    for p in all_pkls:
+        if re.search(r"label|encoder", p.name, flags=re.I):
+            guess_encoder = str(p); break
+    if guess_encoder is None and len(all_pkls_sorted) > 1:
+        guess_encoder = str(all_pkls_sorted[-1])
+    if guess_model and guess_encoder and guess_model != guess_encoder:
+        print(f"[models] Encontrados (heurística):\n  MODEL  = {guess_model}\n  ENCODER= {guess_encoder}")
+        return guess_model, guess_encoder
+    raise FileNotFoundError("No pude identificar modelo y encoder dentro de 'models/'.")
 
-    # aplicar shrinkage (tiempos no productivos)
-    agents_with_shrink = math.ceil(best_n / (1 - shrinkage))
-    return max(1, agents_with_shrink)
-
-# ========= CARGA ARTEFACTOS Y DATASET =========
+# ========== CARGA ARTEFACTOS Y DATASET (DATASET OPCIONAL) ==========
 def load_artifacts():
-    rf = joblib.load(MODEL_PATH)
-    le = joblib.load(ENCODER_PATH)
+    model_path, encoder_path = find_artifact_paths(MODELS_DIR)
+    rf = joblib.load(model_path)
+    le = joblib.load(encoder_path)
     base = None
-    if os.path.exists(DATASET_PATH):
-        base = pd.read_parquet(DATASET_PATH)
+    dataset_path = Path(DATA_DIR) / "dataset_entrenamiento_llamadas.parquet"
+    if dataset_path.exists():
+        base = pd.read_parquet(dataset_path)
     return rf, le, base
 
-# ========= ADAPTADORES DE JSON (CLIMA / TURNOS) =========
+# ========== ADAPTADORES DE JSON ==========
 def fetch_json(url):
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
 def parse_clima_json(raw):
-    """
-    Adaptador: devuélveme dataframe con columnas:
-    ['fecha','hora','comuna_norm','temperatura_c','lluvia_mm','viento_kmh']
-    """
     rows = []
     for item in raw:
-        # Ajusta aquí si tus claves reales son distintas
-        dt_val   = item.get("datetime") or item.get("fecha_hora") or item.get("dt")
-        comuna   = item.get("comuna") or item.get("location") or item.get("city")
-        temp_c   = item.get("temp_c") or item.get("Temp_C")
-        precip   = item.get("precip_mm") or item.get("Precip_mm") or item.get("lluvia_mm")
-        viento   = item.get("viento_kmh") or item.get("wind_kmh") or item.get("Viento_kmh")
-
+        dt_val = item.get("datetime") or item.get("fecha_hora") or item.get("dt")
+        comuna = item.get("comuna") or item.get("location") or item.get("city")
+        temp_c = item.get("temp_c") or item.get("Temp_C") or item.get("temperatura_c")
+        precip = item.get("precip_mm") or item.get("Precip_mm") or item.get("lluvia_mm")
+        viento = item.get("viento_kmh") or item.get("wind_kmh") or item.get("Viento_kmh")
         if not dt_val or not comuna: 
             continue
         try:
@@ -163,20 +169,16 @@ def parse_clima_json(raw):
             "lluvia_mm": float(precip) if precip is not None else np.nan,
             "viento_kmh": float(viento) if viento is not None else np.nan
         })
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 def parse_turnos_json(raw):
-    """
-    Adaptador: dataframe con columnas ['fecha','hora','comuna_norm','agentes_planificados']
-    """
     rows = []
     for item in raw:
         fecha  = item.get("fecha")
         hora   = item.get("hora")
-        comuna = item.get("comuna") or item.get("location")
+        comuna = item.get("comuna") or item.get("location") or item.get("site")
         agentes= item.get("agentes_planificados") or item.get("agentes") or item.get("personas")
-        if not fecha or not hora or not comuna:
+        if not fecha or not hora or not comuna: 
             continue
         rows.append({
             "fecha": fecha,
@@ -186,30 +188,40 @@ def parse_turnos_json(raw):
         })
     return pd.DataFrame(rows)
 
-# ========= REFERENCIAS (TMO / CLIMA TÍPICO) A PARTIR DEL DATASET =========
-def build_refs(base):
-    # TMO típico por hora (mediana)
+# ========== REFERENCIAS Y FALLBACKS CUANDO NO HAY DATASET ==========
+def build_refs_when_no_dataset():
+    """Valores razonables sin dataset."""
+    # TMO por hora: 210s (3.5min) para todas las horas
+    tmo_by_hour = {h:210 for h in range(24)}
+    # clima típico nulo (0 lluvia, 10°C, 15 km/h) — se ajusta por hora si quieres
+    clima_ref = pd.DataFrame({
+        "comuna_norm":["global"]*24,
+        "_mes":[1]*24,
+        "_hora":list(range(24)),
+        "temperatura_c":[10]*24,
+        "lluvia_mm":[0.0]*24,
+        "viento_kmh":[15]*24
+    })
+    return "tmo_segundos", tmo_by_hour, clima_ref
+
+def get_refs(base: pd.DataFrame|None):
+    if base is None or base.empty:
+        return build_refs_when_no_dataset()
+    # con dataset: mediana por hora
     tmo_col = "tmo_segundos" if "tmo_segundos" in base.columns else ("TMO" if "TMO" in base.columns else None)
     if tmo_col is None:
-        base["tmo_segundos"] = 210
-        tmo_col = "tmo_segundos"
+        base["tmo_segundos"] = 210; tmo_col = "tmo_segundos"
     base["_hora_int"] = pd.to_datetime(base["hora"], format="%H:%M", errors="coerce").dt.hour
     tmo_by_hour = base.groupby("_hora_int")[tmo_col].median().to_dict()
-
-    # Clima típico por comuna/mes/hora (medianas)
     for c in ["temperatura_c","lluvia_mm","viento_kmh"]:
-        if c not in base.columns:
-            base[c] = np.nan
+        if c not in base.columns: base[c] = np.nan
     base["_mes"]  = pd.to_datetime(base["fecha"]).dt.month
     base["_hora"] = base["_hora_int"]
     clima_ref = (base.groupby(["comuna_norm","_mes","_hora"])
-                 [["temperatura_c","lluvia_mm","viento_kmh"]]
-                 .median()
-                 .reset_index())
-
+                 [["temperatura_c","lluvia_mm","viento_kmh"]].median().reset_index())
     return tmo_col, tmo_by_hour, clima_ref
 
-# ========= PREDICCIÓN ITERATIVA (usa lags con histórico) =========
+# ========== PREDICCIÓN ITERATIVA ==========
 FEATURES = [
     "tmo_segundos",
     "temperatura_c","lluvia_mm","viento_kmh",
@@ -220,64 +232,50 @@ FEATURES = [
 ]
 
 def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_obj=None):
-    """
-    Predice hora a hora usando lags alimentados con las predicciones previas.
-    - clima_df: clima futuro (fecha/hora/comuna_norm/temperatura/lluvia/viento)
-    """
+    # si no hay dataset, fabricamos un histórico mínimo para arrancar lags
+    if base is None or base.empty:
+        # histórico ficticio de 36 horas “suaves”
+        dt0 = (pd.Timestamp.now().normalize() - pd.Timedelta(hours=36))
+        hist = pd.date_range(start=dt0, periods=36, freq="H")
+        base = pd.DataFrame({
+            "fecha": hist.strftime("%Y-%m-%d"),
+            "hora":  hist.strftime("%H:%M"),
+            "comuna_norm": ["global"]*len(hist),
+            "conteo": np.maximum(0, np.round(100 + 30*np.sin(np.linspace(0, 3.14, len(hist)))))
+        })
     base = base.copy()
     base["dt"] = pd.to_datetime(base["fecha"] + " " + base["hora"], errors="coerce")
-
-    # elegir comunas
-    if not comunas_obj:
+    if comunas_obj is None or len(comunas_obj)==0:
         mc = (base.groupby("comuna_norm")["conteo"].sum().sort_values(ascending=False).index[0])
         comunas_obj = [mc]
-
-    # refs
-    tmo_col, tmo_by_hour, clima_ref = build_refs(base)
-
+    tmo_col, tmo_by_hour, clima_ref = get_refs(base)
     fechas_h = pd.date_range(start=start_dt, periods=horizon_hours, freq="H")
 
     resultados = []
     for comuna in comunas_obj:
         dfc = base[base["comuna_norm"] == comuna].copy().sort_values("dt")
         if dfc.empty:
-            continue
-        # estado para lags
+            dfc = base.copy()
         serie_hist = dfc[["dt","conteo"]].dropna().copy()
-
         for dtf in fechas_h:
-            fecha = dtf.strftime("%Y-%m-%d")
-            hora  = dtf.strftime("%H:%M")
-            h_int = dtf.hour
-            mes_i = dtf.month
-
-            # TMO típico por hora
-            tmo_val = tmo_by_hour.get(h_int, float(np.nan))
-            if pd.isna(tmo_val):
-                tmo_val = base[tmo_col].median()
-
-            # Clima futuro: intenta usar el pronóstico entregado, si no, fallback mediana histórica
-            rowc = clima_df[(clima_df["comuna_norm"]==comuna) &
-                            (clima_df["fecha"]==fecha) &
-                            (clima_df["hora"]==hora)]
+            fecha = dtf.strftime("%Y-%m-%d"); hora = dtf.strftime("%H:%M")
+            h_int = dtf.hour; mes_i = dtf.month
+            tmo_val = tmo_by_hour.get(h_int, 210)
+            rowc = clima_df[(clima_df["comuna_norm"]==comuna) & (clima_df["fecha"]==fecha) & (clima_df["hora"]==hora)]
             if len(rowc)==0:
-                rowc = clima_ref[(clima_ref["comuna_norm"]==comuna) &
-                                 (clima_ref["_mes"]==mes_i) &
-                                 (clima_ref["_hora"]==h_int)]
+                if "comuna_norm" in clima_ref.columns:
+                    rowc = clima_ref[(clima_ref["comuna_norm"]==comuna) & (clima_ref["_mes"]==mes_i) & (clima_ref["_hora"]==h_int)]
+                else:
+                    rowc = clima_ref[clima_ref["_hora"]==h_int]
                 if len(rowc)==0:
-                    rowc = pd.DataFrame({
-                        "temperatura_c":[base["temperatura_c"].median()],
-                        "lluvia_mm":[base["lluvia_mm"].median()],
-                        "viento_kmh":[base["viento_kmh"].median()]
-                    })
-            temperatura = float(rowc["temperatura_c"].iloc[0]) if "temperatura_c" in rowc else float("nan")
-            lluvia      = float(rowc["lluvia_mm"].iloc[0])      if "lluvia_mm" in rowc else float("nan")
-            viento      = float(rowc["viento_kmh"].iloc[0])     if "viento_kmh" in rowc else float("nan")
+                    rowc = pd.DataFrame({"temperatura_c":[10],"lluvia_mm":[0.0],"viento_kmh":[15]})
+            temperatura = float(rowc["temperatura_c"].iloc[0]) if "temperatura_c" in rowc else 10.0
+            lluvia      = float(rowc["lluvia_mm"].iloc[0])      if "lluvia_mm" in rowc      else 0.0
+            viento      = float(rowc["viento_kmh"].iloc[0])     if "viento_kmh" in rowc     else 15.0
 
-            # Lags desde serie + pred previas
-            lag_1h  = float(serie_hist["conteo"].iloc[-1]) if len(serie_hist)>0 else np.nan
-            lag_24h = float(serie_hist["conteo"].iloc[-24]) if len(serie_hist)>=24 else np.nan
-            roll_mean_24h = float(serie_hist["conteo"].tail(24).mean()) if len(serie_hist)>0 else np.nan
+            lag_1h  = float(serie_hist["conteo"].iloc[-1]) if len(serie_hist)>0 else 100.0
+            lag_24h = float(serie_hist["conteo"].iloc[-24]) if len(serie_hist)>=24 else lag_1h
+            roll_mean_24h = float(serie_hist["conteo"].tail(24).mean()) if len(serie_hist)>0 else lag_1h
 
             fila = pd.DataFrame({
                 "fecha":[fecha], "hora":[hora],
@@ -288,26 +286,25 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
             })
             fila = cal_feats(fila, "fecha")
 
-            # comuna_id
             try:
                 comuna_id = int(le.transform([comuna])[0])
             except Exception:
-                comuna_id = int(le.transform([base["comuna_norm"].mode().iloc[0]])[0])
+                try:
+                    comuna_id = int(le.transform([base["comuna_norm"].mode().iloc[0]])[0])
+                except Exception:
+                    comuna_id = 0
 
             fila["lag_1h"] = lag_1h
             fila["lag_24h"] = lag_24h
             fila["roll_mean_24h"] = roll_mean_24h
             fila["comuna_id"] = comuna_id
 
-            # completar NaN básicos
             for c in ["tmo_segundos","temperatura_c","lluvia_mm","viento_kmh","lag_1h","lag_24h","roll_mean_24h"]:
                 if pd.isna(fila[c].iloc[0]):
-                    med = base[c].median() if c in base.columns else 0.0
-                    fila[c] = med
+                    fila[c] = 0.0
 
             yhat = float(rf.predict(fila[FEATURES])[0])
             yhat = max(0.0, yhat)
-
             serie_hist = pd.concat([serie_hist, pd.DataFrame({"dt":[dtf], "conteo":[yhat]})], ignore_index=True)
 
             resultados.append({
@@ -317,120 +314,33 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
                 "llamadas": int(round(yhat)),
                 "tmo_segundos": int(round(tmo_val))
             })
+    return pd.DataFrame(resultados).sort_values(["comuna","fecha","hora"])
 
-    df_out = pd.DataFrame(resultados).sort_values(["comuna","fecha","hora"])
-    return df_out
-
-# ========= ALERTAS CLIMA (uplift vs baseline) =========
-def generar_alertas_clima(pred_clima, pred_baseline):
-    # baseline: mismo horizonte pero usando clima mediano histórico (ya lo hacemos en fallback)
-    # Aquí comparamos predicciones con clima real pronosticado vs predicción con clima “típico”
-    # Para construir baseline, re-llamamos predict_iterativo con clima_df vacío:
-    key = ["comuna","fecha","hora"]
-    m = pred_clima.merge(pred_baseline, on=key, suffixes=("_clima", "_base"))
-    m["uplift"] = m["llamadas_clima"] - m["llamadas_base"]
-    alertas = m[m["uplift"] >= MIN_UPLIFT_LLAMADAS].copy()
-    # compactar JSON de alertas
-    out = []
-    for _, r in alertas.iterrows():
-        out.append({
-            "comuna": r["comuna"],
-            "fecha": r["fecha"],
-            "hora": r["hora"],
-            "llamadas_baseline": int(r["llamadas_base"]),
-            "llamadas_con_clima": int(r["llamadas_clima"]),
-            "uplift_llamadas": int(r["uplift"]),
-            # recomendación de agentes extra
-            "agentes_extra_recomendados": required_agents(
-                calls_per_hour=r["llamadas_clima"],
-                aht_sec=r.get("tmo_segundos_clima", 210),
-                asa_target_sec=ASA_SECONDS, sla_target=SLA_TARGET,
-                occ_max=OCC_MAX, shrinkage=SHRINKAGE
-            ) - required_agents(
-                calls_per_hour=r["llamadas_base"],
-                aht_sec=r.get("tmo_segundos_base", 210),
-                asa_target_sec=ASA_SECONDS, sla_target=SLA_TARGET,
-                occ_max=OCC_MAX, shrinkage=SHRINKAGE
-            )
-        })
-    return out
-
-# ========= FORECAST MENSUAL (2 meses) =========
-def generar_forecast_mensual(rf, le, base, clima_ref):
+# ========== GENERADORES DE SALIDA ==========
+def generar_forecast_mensual(rf, le, base):
     inicio = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
     fin    = (inicio + pd.DateOffset(months=MESES_FORECAST)).normalize()
     horas  = int((fin - inicio) / pd.Timedelta(hours=1))
-    # Para meses futuros, usamos clima “típico” (clima_ref) como clima_df vacío → fallback
     pred = predict_iterativo(rf, le, base, clima_df=pd.DataFrame(columns=["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"]),
                              start_dt=inicio, horizon_hours=horas, comunas_obj=None)
-    # Agentes requeridos por Erlang C
     pred["agentes_requeridos"] = pred.apply(
         lambda r: required_agents(r["llamadas"], r["tmo_segundos"], ASA_SECONDS, SLA_TARGET, occ_max=OCC_MAX, shrinkage=SHRINKAGE),
         axis=1
     )
-    # Renombrar para salida
     pred = pred.rename(columns={"llamadas":"pronostico_llamadas", "tmo_segundos":"tmo"})
     return pred[["comuna","fecha","hora","tmo","pronostico_llamadas","agentes_requeridos"]]
 
-# ========= ALERTAS TURNOS =========
-def generar_alertas_turnos(forecast_df, turnos_df):
-    key = ["comuna","fecha","hora"]
-    # unificar nombres
-    turnos_df = turnos_df.rename(columns={"agentes_planificados":"agentes_planificados"})
-    m = forecast_df.merge(turnos_df, on=key, how="left").fillna({"agentes_planificados":0})
-    m["faltantes"] = (m["agentes_requeridos"] - m["agentes_planificados"]).clip(lower=0)
-    alertas = m[m["faltantes"] > 0].copy()
-    out = []
-    for _, r in alertas.iterrows():
-        out.append({
-            "comuna": r["comuna"],
-            "fecha": r["fecha"],
-            "hora": r["hora"],
-            "agentes_planificados": int(r["agentes_planificados"]),
-            "agentes_requeridos": int(r["agentes_requeridos"]),
-            "faltantes": int(r["faltantes"])
-        })
-    return out
-
-# ========= MAIN =========
-def main():
-    ensure_dir(OUT_DIR)
-    rf, le, base = load_artifacts()
-    if base is None:
-        raise FileNotFoundError("Falta data/dataset_entrenamiento_llamadas.parquet (recomendado para bootstrapping de lags/TMO/clima).")
-
-    # refs
-    _, tmo_by_hour, clima_ref = build_refs(base)
-
-    # --- 1) PRONÓSTICO PARA ALERTAS CLIMÁTICAS (1 semana) ---
+def generar_alertas_clima(rf, le, base, clima_df):
     start_alert = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
-    # clima real (URL)
-    clima_df = pd.DataFrame(columns=["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"])
-    if CLIMA_URL:
-        try:
-            clima_raw = fetch_json(CLIMA_URL)
-            clima_df = parse_clima_json(clima_raw)
-        except Exception as e:
-            print("WARN: no se pudo leer CLIMA_URL:", e)
-
-    # pred con clima real
     pred_clima = predict_iterativo(rf, le, base, clima_df, start_alert, HORIZON_ALERTAS_H, comunas_obj=None)
-    pred_clima = pred_clima.rename(columns={"llamadas":"llamadas", "tmo_segundos":"tmo_segundos"})
-
-    # baseline (clima típico = clima_df vacío → fallback)
-    pred_base = predict_iterativo(rf, le, base, clima_df=pd.DataFrame(columns=clima_df.columns),
-                                  start_dt=start_alert, horizon_hours=HORIZON_ALERTAS_H, comunas_obj=None)
-    pred_base = pred_base.rename(columns={"llamadas":"llamadas", "tmo_segundos":"tmo_segundos"})
-
-    # Unir para construir alertas (con info de TMO también)
+    pred_base  = predict_iterativo(rf, le, base, pd.DataFrame(columns=clima_df.columns), start_alert, HORIZON_ALERTAS_H, comunas_obj=None)
     key = ["comuna","fecha","hora"]
-    m1 = pred_clima.merge(pred_base, on=key, suffixes=("_clima","_base"))
-
-    alertas = []
-    for _, r in m1.iterrows():
+    m = pred_clima.merge(pred_base, on=key, suffixes=("_clima","_base"))
+    out = []
+    for _, r in m.iterrows():
         uplift = int(round(r["llamadas_clima"] - r["llamadas_base"]))
         if uplift >= MIN_UPLIFT_LLAMADAS:
-            alertas.append({
+            out.append({
                 "comuna": r["comuna"],
                 "fecha": r["fecha"],
                 "hora": r["hora"],
@@ -446,34 +356,56 @@ def main():
                     ASA_SECONDS, SLA_TARGET, occ_max=OCC_MAX, shrinkage=SHRINKAGE
                 )
             })
+    return out
 
+def generar_alertas_turnos(forecast_df, turnos_df):
+    key = ["comuna","fecha","hora"]
+    m = forecast_df.merge(turnos_df, on=key, how="inner").fillna({"agentes_planificados":0})
+    m["faltantes"] = (m["agentes_requeridos"] - m["agentes_planificados"]).clip(lower=0)
+    alertas = []
+    for _, r in m[m["faltantes"] > 0].iterrows():
+        alertas.append({
+            "comuna": r["comuna"],
+            "fecha": r["fecha"],
+            "hora": r["hora"],
+            "agentes_planificados": int(r["agentes_planificados"]),
+            "agentes_requeridos": int(r["agentes_requeridos"]),
+            "faltantes": int(r["faltantes"])
+        })
+    return alertas
+
+# ========== MAIN ==========
+def main():
+    ensure_dir(OUT_DIR)
+    rf, le, base = load_artifacts()
+    if base is None:
+        print("WARN: no hay dataset en data/. Se usarán valores de respaldo (TMO/clima/series mínimas).")
+
+    # 1) Clima futuro (si hay URL)
+    clima_df = pd.DataFrame(columns=["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"])
+    if CLIMA_URL:
+        try:
+            clima_raw = fetch_json(CLIMA_URL)
+            clima_df = parse_clima_json(clima_raw)
+        except Exception as e:
+            print("WARN: no se pudo leer CLIMA_URL:", e)
+
+    # 2) Alertas climáticas (1 semana)
+    alertas_clima = generar_alertas_clima(rf, le, base, clima_df)
     with open(os.path.join(OUT_DIR, "alertas_climatologicas.json"), "w", encoding="utf-8") as f:
-        json.dump(alertas, f, ensure_ascii=False, indent=2)
+        json.dump(alertas_clima, f, ensure_ascii=False, indent=2)
 
-    # --- 2) FORECAST MENSUAL (2 meses) ---
-    forecast_mensual = generar_forecast_mensual(rf, le, base, clima_ref)
+    # 3) Forecast mensual (2 meses)
+    forecast_mensual = generar_forecast_mensual(rf, le, base)
     forecast_mensual.to_json(os.path.join(OUT_DIR, "forecast_mensual.json"), orient="records", force_ascii=False, indent=2)
 
-    # --- 3) ALERTAS DE TURNOS ---
+    # 4) Alertas de turnos (si hay URL)
     alertas_turnos = []
     if TURNOS_URL:
         try:
             turnos_raw = fetch_json(TURNOS_URL)
             df_turnos = parse_turnos_json(turnos_raw)
-            # Comparar vs forecast_mensual en el rango que cubran los turnos
-            key = ["comuna","fecha","hora"]
-            merged = forecast_mensual.merge(df_turnos, on=key, how="inner")
-            if not merged.empty:
-                merged["faltantes"] = (merged["agentes_requeridos"] - merged["agentes_planificados"]).clip(lower=0)
-                for _, r in merged[merged["faltantes"] > 0].iterrows():
-                    alertas_turnos.append({
-                        "comuna": r["comuna"],
-                        "fecha": r["fecha"],
-                        "hora": r["hora"],
-                        "agentes_planificados": int(r["agentes_planificados"]),
-                        "agentes_requeridos": int(r["agentes_requeridos"]),
-                        "faltantes": int(r["faltantes"])
-                    })
+            alertas_turnos = generar_alertas_turnos(forecast_mensual, df_turnos)
         except Exception as e:
             print("WARN: no se pudo leer TURNOS_URL:", e)
 
