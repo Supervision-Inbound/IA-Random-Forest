@@ -2,107 +2,128 @@ name: IA Forecast + Alertas
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "0 6 * * *"   # opcional: ejecutar diario 06:00 UTC
-
-permissions:
-  contents: write
+    inputs:
+      FAST_GLOBAL:
+        description: "1=predecir y agregar global (rápido) / 0=procesar comunas indicado (lento)"
+        default: "1"
+        required: true
+      MAX_COMUNAS:
+        description: "Límite de comunas a procesar si FAST_GLOBAL=0"
+        default: "20"
+        required: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Hiperparámetros Erlang C (puedes ajustarlos desde la UI si quieres)
+      SLA_TARGET: "0.9"
+      ASA_SECONDS: "20"
+      OCCUPANCY_MAX: "0.85"
+      SHRINKAGE: "0.30"
+      # URLs opcionales
+      CLIMA_URL: ${{ vars.CLIMA_URL }}
+      TURNOS_URL: ${{ vars.TURNOS_URL }}
+      # Si exiges dataset: "1" (si no está en release, falla)
+      REQUIRE_DATASET: "0"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'       # ✅ acelera corridas siguientes
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy scikit-learn joblib python-dateutil requests pyarrow fastparquet
 
-      - name: Install unzip & jq
-        run: sudo apt-get update && sudo apt-get install -y unzip jq
+      - name: Prepare dirs
+        run: |
+          mkdir -p models data out
 
-      # ====== MODELOS ======
+      # ---------- Descarga de assets del último release ----------
       - name: Download models.zip from latest Release
         env:
-          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          mkdir -p models
-          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
-          ASSET_URL=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" "$API" \
-            | jq -r '.assets[] | select(.name=="models.zip") | .url')
-          if [ -z "$ASSET_URL" ]; then
-            echo "models.zip no encontrado en el último release"; exit 1
+          set -e
+          API="https://api.github.com/repos/${REPO}/releases/latest"
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$API" \
+                 | jq -r '.assets[] | select(.name=="models.zip") | .url')
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "No se encontró models.zip en el último release"; exit 1
           fi
-          curl -L -H "Authorization: Bearer ${GH_TOKEN}" \
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
                -H "Accept: application/octet-stream" \
-               "$ASSET_URL" -o models.zip
+               -o models.zip "$URL"
           unzip -o models.zip -d models
-          echo "PKLs en models/"; find models -maxdepth 3 -type f -name "*.pkl" -ls
+          echo "Contenido de models/:"
+          find models -maxdepth 3 -type f -name "*.pkl" -ls
 
-      # ====== DATASET PARQUET ======
       - name: Download dataset (parquet) from latest Release
         env:
-          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          mkdir -p data
-          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
-          DATA_URL=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" "$API" \
-            | jq -r '.assets[] | select(.name=="dataset_entrenamiento_llamadas.parquet") | .url')
-          if [ -z "$DATA_URL" ]; then
-            echo "dataset_entrenamiento_llamadas.parquet no encontrado en el último release"; exit 1
+          set -e
+          API="https://api.github.com/repos/${REPO}/releases/latest"
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$API" \
+                 | jq -r '.assets[] | select(.name=="dataset_entrenamiento_llamadas.parquet") | .url')
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "WARN: No se encontró dataset_entrenamiento_llamadas.parquet en el último release"
+          else
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/octet-stream" \
+                 -o data/dataset_entrenamiento_llamadas.parquet "$URL"
+            echo "Descargado data/dataset_entrenamiento_llamadas.parquet"
           fi
-          curl -L -H "Authorization: Bearer ${GH_TOKEN}" \
-               -H "Accept: application/octet-stream" \
-               "$DATA_URL" -o data/dataset_entrenamiento_llamadas.parquet
-          ls -lh data
+
+      # ---------- Guardas para evitar el error del name ----------
+      - name: Show revision & files
+        run: |
+          echo "Branch: $GITHUB_REF  SHA: $GITHUB_SHA"
+          git log -1 --oneline
+          ls -la
+
+      - name: Guard: verify _name_ sentinel
+        run: |
+          set -e
+          echo "Últimas líneas de run_pipeline.py:"
+          tail -n 14 run_pipeline.py || true
+          echo "Buscando '_name_'..."
+          grep -n "_name_" run_pipeline.py
+          echo "Buscando typo 'name'..."
+          if grep -n "name" run_pipeline.py ; then
+            echo "ERROR: Se encontró 'name'. Debe ser '_name_' (doble guion bajo)."
+            exit 1
+          fi
 
       - name: Run pipeline
         env:
-          # Fuentes externas (opcional)
-          CLIMA_URL:     ${{ secrets.CLIMA_URL }}
-          TURNOS_URL:    ${{ secrets.TURNOS_URL }}
-
-          # Erlang C (opcional) – si no están, el script usa defaults
-          SLA_TARGET:    ${{ secrets.SLA_TARGET }}
-          ASA_SECONDS:   ${{ secrets.ASA_SECONDS }}
-          OCCUPANCY_MAX: ${{ secrets.OCCUPANCY_MAX }}
-          SHRINKAGE:     ${{ secrets.SHRINKAGE }}
-
-          # ⚡ Performance y modo nacional:
-          FAST_GLOBAL:   "1"      # 1 = solo serie global
-          MAX_COMUNAS:   "20"     # límite si FAST_GLOBAL=0
-
-          # Exigir parquet (si falta, el run falla – no hay fallback)
-          REQUIRE_DATASET: "1"
+          FAST_GLOBAL: ${{ github.event.inputs.FAST_GLOBAL || '1' }}
+          MAX_COMUNAS: ${{ github.event.inputs.MAX_COMUNAS || '20' }}
         run: |
           echo "FAST_GLOBAL=${FAST_GLOBAL}  MAX_COMUNAS=${MAX_COMUNAS}"
-          date
           python run_pipeline.py
-          date
-
-      - name: Inspect outputs
-        run: |
-          echo "SHA256 de salidas:"
-          sha256sum out/forecast_mensual.json || true
-          sha256sum out/alertas_climatologicas.json || true
-          sha256sum out/alertas_turnos.json || true
-          echo "--- HEAD forecast_mensual.json ---"
-          head -n 20 out/forecast_mensual.json || true
 
       - name: Commit JSON outputs
+        if: always()
         run: |
+          set -e
+          git config user.email "actions@github.com"
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "chore: actualizar JSONs de forecast/alertas" || echo "Nada que commitear"
-          git push
-
+          if [ -n "$(git status --porcelain out/)" ]; then
+            git add out/*.json || true
+            git commit -m "chore: actualizar JSONs de forecast/alertas"
+            git push
+          else
+            echo "No hubo cambios en out/*.json"
+          fi
