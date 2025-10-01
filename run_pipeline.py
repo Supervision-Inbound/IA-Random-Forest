@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -- coding: utf-8 --
 import os, re, json, math, unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -269,29 +269,100 @@ def _build_future_frame(start_dt, hours):
     })
     return df
 
+# ----------- NUEVA VERSIÓN ROBUSTA --------------
 def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
+    """
+    Garantiza que fut tenga columnas de clima; si hay clima_df las usa,
+    si faltan valores completa con clima_ref (por _mes/_hora), y finalmente
+    aplica defaults.
+    """
+    # 1) Asegura columnas en fut
+    for col in ["temperatura_c", "lluvia_mm", "viento_kmh"]:
+        if col not in fut.columns:
+            fut[col] = np.nan
+
+    # 2) Si viene clima_df, normaliza y mergea por fecha/hora
     if clima_df is not None and not clima_df.empty:
-        if "comuna_norm" in clima_df.columns:
-            c = clima_df[clima_df["comuna_norm"] == comuna_norm]
-        else:
-            c = clima_df
-        c = c[["fecha","hora","temperatura_c","lluvia_mm","viento_kmh"]].drop_duplicates()
-        fut = fut.merge(c, on=["fecha","hora"], how="left")
-    # fallback con referencia por hora/mes
-    if fut[["temperatura_c","lluvia_mm","viento_kmh"]].isna().any(axis=None):
-        if "comuna_norm" in clima_ref.columns:
-            ref = clima_ref[clima_ref["comuna_norm"] == comuna_norm][["_mes","_hora","temperatura_c","lluvia_mm","viento_kmh"]]
-        else:
-            ref = clima_ref[["_mes","_hora","temperatura_c","lluvia_mm","viento_kmh"]]
-        fut = fut.merge(ref, left_on=["_mes","_hour"], right_on=["_mes","_hora"], how="left", suffixes=("","_ref"))
-        for col in ["temperatura_c","lluvia_mm","viento_kmh"]:
-            fut[col] = fut[col].fillna(fut[f"{col}_ref"])
-            fut.drop(columns=[f"{col}_ref"], inplace=True, errors="ignore")
-    # valores por defecto
+        df = clima_df.copy()
+
+        # Normaliza posibles nombres alternativos
+        alt = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
+        for k, v in alt.items():
+            if k in df.columns and v not in df.columns:
+                df[v] = df[k]
+
+        # Asegura columnas mínimas
+        for col in ["fecha", "hora", "temperatura_c", "lluvia_mm", "viento_kmh"]:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Normaliza hora HH:MM
+        df["hora"] = df["hora"].astype(str).str.slice(0, 5)
+
+        # Filtra por comuna si existe
+        if "comuna_norm" in df.columns:
+            df = df[df["comuna_norm"] == comuna_norm]
+
+        df = df[["fecha", "hora", "temperatura_c", "lluvia_mm", "viento_kmh"]].drop_duplicates()
+
+        # Merge principal
+        fut = fut.merge(df, on=["fecha", "hora"], how="left", suffixes=("", "_new"))
+
+        # Combina columnas nuevas si quedaron con sufijo _new
+        for col in ["temperatura_c", "lluvia_mm", "viento_kmh"]:
+            newcol = f"{col}_new"
+            if newcol in fut.columns:
+                fut[col] = fut[col].combine_first(fut[newcol])
+                fut.drop(columns=[newcol], inplace=True)
+
+    # 3) Completa faltantes con clima_ref (por _mes/_hora)
+    need_ref = fut[["temperatura_c", "lluvia_mm", "viento_kmh"]].isna().any(axis=1).any()
+    if need_ref and clima_ref is not None and not clima_ref.empty:
+        ref = clima_ref.copy()
+
+        # Normaliza posibles nombres alternativos
+        alt = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
+        for k, v in alt.items():
+            if k in ref.columns and v not in ref.columns:
+                ref[v] = ref[k]
+
+        # Intenta construir _mes/_hora si no existen en ref
+        if "_mes" not in ref.columns or "_hora" not in ref.columns:
+            if "fecha" in ref.columns and "hora" in ref.columns:
+                dtt = pd.to_datetime(ref["fecha"] + " " + ref["hora"], errors="coerce")
+                ref["_mes"] = dtt.dt.month
+                ref["_hora"] = dtt.dt.hour
+
+        # Filtra por comuna si aplica
+        if "comuna_norm" in ref.columns:
+            ref = ref[ref["comuna_norm"] == comuna_norm]
+
+        # Dejamos solo claves y valores esperados
+        cols_ok = ["_mes", "_hora", "temperatura_c", "lluvia_mm", "viento_kmh"]
+        ref = ref[[c for c in cols_ok if c in ref.columns]].drop_duplicates()
+
+        if {"_mes", "_hora"}.issubset(ref.columns):
+            fut = fut.merge(
+                ref,
+                left_on=["_mes", "_hour"],
+                right_on=["_mes", "_hora"],
+                how="left",
+                suffixes=("", "_ref"),
+            )
+            for col in ["temperatura_c", "lluvia_mm", "viento_kmh"]:
+                rcol = f"{col}_ref"
+                if rcol in fut.columns:
+                    fut[col] = fut[col].fillna(fut[rcol])
+                    fut.drop(columns=[rcol], inplace=True, errors="ignore")
+            fut.drop(columns=["_mes", "_hora"], inplace=True, errors="ignore")
+
+    # 4) Defaults finales
     fut["temperatura_c"] = fut["temperatura_c"].fillna(10.0)
     fut["lluvia_mm"]     = fut["lluvia_mm"].fillna(0.0)
     fut["viento_kmh"]    = fut["viento_kmh"].fillna(15.0)
+
     return fut
+# ------------------------------------------------
 
 def _compute_lags_numpy(hist_vals, horizon_len):
     last = hist_vals[-1] if hist_vals.size else 100.0
@@ -304,7 +375,6 @@ def _compute_lags_numpy(hist_vals, horizon_len):
             hist_24 = hist_vals[-24:] if hist_vals.size >= 1 else np.array([last])
             rmean = float(np.mean(hist_24))
         else:
-            # aproximación: rolling con lo ya predicho
             window = yhat[max(0, i-24):i]
             if window.size == 0:
                 window = np.array([l1])
@@ -606,6 +676,5 @@ def main():
 
     print("OK: JSONs globales generados en 'out/'")
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
-
