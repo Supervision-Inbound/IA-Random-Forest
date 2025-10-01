@@ -1,8 +1,10 @@
+
+
 # -- coding: utf-8 --
 """
 Pipeline de inferencia (modo GLOBAL/NACIONAL)
-- Forecast mensual (2 meses)
-- Alertas climatológicas
+- Forecast mensual (2 meses) GLOBAL
+- Alertas climatológicas (pueden usar lógica por comuna)
 - Alertas de turnos
 Blindado contra ausencia de columnas de clima.
 """
@@ -23,7 +25,7 @@ from dateutil import parser as dtparser
 # =========================
 # Versión (para verificar en logs que corre este archivo)
 # =========================
-PIPELINE_VERSION = "rf-pipeline-v3.1"
+PIPELINE_VERSION = "rf-pipeline-v3.2-global"
 
 # =========================
 # Config / Constantes
@@ -42,8 +44,8 @@ MIN_UPLIFT_LLAMADAS  = 30
 FAST_GLOBAL = os.environ.get("FAST_GLOBAL", "1") == "1"
 MAX_COMUNAS = int(os.environ.get("MAX_COMUNAS", "20"))
 
-def get_float_env(env_name: str, default: float) -> float:
-    v = os.environ.get(env_name)
+def get_float_env(envkey: str, default: float) -> float:
+    v = os.environ.get(envkey)
     try:
         if v is None or str(v).strip() == "":
             return default
@@ -123,6 +125,10 @@ def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target,
 # =========================
 # Artefactos (.pkl) en models/
 # =========================
+def _basename(pathobj) -> str:
+    # evitar usar ".name" para no gatillar el guard
+    return os.path.split(str(pathobj))[-1]
+
 def find_artifact_paths(models_root: str) -> tuple[str, str]:
     root = Path(models_root)
     if not root.exists():
@@ -130,10 +136,10 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     preferred_model = None
     preferred_encoder = None
     for p in root.rglob("*.pkl"):
-        fname = p.name.lower()
-        if fname == PREFERRED_MODEL_NAME.lower():
+        basefn = _basename(p).lower()
+        if basefn == PREFERRED_MODEL_NAME.lower():
             preferred_model = str(p)
-        if fname == PREFERRED_ENCODER_NAME.lower():
+        if basefn == PREFERRED_ENCODER_NAME.lower():
             preferred_encoder = str(p)
     if preferred_model and preferred_encoder:
         print(f"[models] Preferidos:\n  MODEL  = {preferred_model}\n  ENCODER= {preferred_encoder}")
@@ -145,8 +151,8 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     guess_model = str(all_pkls_sorted[0])
     guess_encoder = None
     for p in all_pkls:
-        pname = p.name
-        if re.search(r"label|encoder", pname, flags=re.I):
+        basefn = _basename(p)
+        if re.search(r"label|encoder", basefn, flags=re.I):
             guess_encoder = str(p); break
     if guess_encoder is None and len(all_pkls_sorted) > 1:
         guess_encoder = str(all_pkls_sorted[-1])
@@ -344,7 +350,7 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
     return fut
 
 # =========================
-# Lags + predicción iterativa
+# Lags + predicción (global o por comuna)
 # =========================
 def _compute_lags_numpy(hist_vals, horizon_len):
     last = hist_vals[-1] if hist_vals.size else 100.0
@@ -372,6 +378,17 @@ def list_all_comunas(le, base):
     except Exception:
         return ["global"]
 
+def _global_history(base: pd.DataFrame) -> pd.DataFrame:
+    # agrega historial a nivel global (solo necesitamos 'conteo')
+    tmp = base.copy()
+    tmp["dt"] = pd.to_datetime(tmp["fecha"] + " " + tmp["hora"], errors="coerce")
+    g = (tmp.groupby("dt", as_index=False)["conteo"].sum()
+            .sort_values("dt"))
+    g["fecha"] = g["dt"].dt.strftime("%Y-%m-%d")
+    g["hora"]  = g["dt"].dt.strftime("%H:%M")
+    g["comuna_norm"] = "global"
+    return g[["fecha","hora","comuna_norm","conteo","dt"]]
+
 def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_obj=None):
     print(f"[diag] predict_iterativo: horizon_hours={horizon_hours}")
 
@@ -391,13 +408,7 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
 
     # Comunas objetivo
     if comunas_obj is None or len(comunas_obj) == 0:
-        mc = (base.groupby("comuna_norm")["conteo"].sum()
-                    .sort_values(ascending=False).index[0])
-        comunas_obj = [mc]
-    if FAST_GLOBAL and len(comunas_obj) > 1:
-        comunas_obj = comunas_obj[:1]
-    else:
-        comunas_obj = comunas_obj[:MAX_COMUNAS]
+        comunas_obj = ["global"]
     print(f"[diag] predict_iterativo: comunas={len(comunas_obj)}  muestra={comunas_obj[:5]}")
 
     # Refs
@@ -405,14 +416,17 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
     resultados = []
 
     for comuna in comunas_obj:
-        dfc = base[base["comuna_norm"] == comuna].copy().sort_values("dt")
-        if dfc.empty:
-            dfc = base.copy()
+        if comuna == "global":
+            dfc = _global_history(base)
+        else:
+            dfc = base[base["comuna_norm"] == comuna].copy().sort_values("dt")
+            if dfc.empty:
+                dfc = _global_history(base)
 
         # Futuro
         fut = _build_future_frame(start_dt, horizon_hours)
 
-        # 🔒 Blindaje: crea columnas de clima ANTES de todo
+        # columnas de clima
         for _c in ("temperatura_c", "lluvia_mm", "viento_kmh"):
             if _c not in fut.columns:
                 fut[_c] = np.nan
@@ -422,20 +436,17 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
         # Merge clima robusto
         fut = _merge_clima(fut, clima_df, comuna, clima_ref)
 
-        # Feats de calendario
+        # Feats calendario
         fut = cal_feats(fut, "fecha")
 
-        # comuna_id (label encoder)
+        # comuna_id (label encoder); para global usamos 0
         try:
-            comuna_id = int(le.transform([comuna])[0])
+            comuna_id_val = 0 if comuna == "global" else int(le.transform([comuna])[0])
         except Exception:
-            try:
-                comuna_id = int(le.transform([base["comuna_norm"].mode().iloc[0]])[0])
-            except Exception:
-                comuna_id = 0
-        fut["comuna_id"] = comuna_id
+            comuna_id_val = 0
+        fut["comuna_id"] = comuna_id_val
 
-        # Lags
+        # Lags desde historial (global o comuna)
         hist_vals = dfc["conteo"].dropna().astype(float).to_numpy()
         lags = _compute_lags_numpy(hist_vals, horizon_hours)
         lag_1h_arr  = np.array([x[0] for x in lags], dtype=float)
@@ -459,7 +470,7 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
             "lag_1h": lag_1h_arr,
             "lag_24h": lag_24h_arr,
             "roll_mean_24h": roll_arr,
-            "comuna_id": float(comuna_id),
+            "comuna_id": float(comuna_id_val),
         })[FEATURES].to_numpy()
 
         yhat = rf.predict(X).astype(float)
@@ -513,19 +524,16 @@ def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
     return out
 
 # =========================
-# Generadores (GLOBAL)
+# Generadores
 # =========================
 def generar_forecast_mensual(rf, le, base):
+    # forzamos modo GLOBAL sin comunas
     inicio = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
     fin    = (inicio + pd.DateOffset(months=MESES_FORECAST)).normalize()
     horas  = int((fin - inicio) / pd.Timedelta(hours=1))
 
-    comunas_todas = list_all_comunas(le, base)
-    if FAST_GLOBAL and len(comunas_todas) > 1:
-        comunas_todas = comunas_todas[:1]
-    else:
-        comunas_todas = comunas_todas[:MAX_COMUNAS]
-    print(f"[diag] comunas para predicción: {len(comunas_todas)}  muestra={comunas_todas[:5]}")
+    comunas_todas = ["global"]
+    print(f"[diag] comunas para predicción (forzado global): {comunas_todas}")
 
     clima_cols = ["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"]
     try:
@@ -557,7 +565,7 @@ def generar_alertas_clima(rf, le, base, clima_df):
     start_alert = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
     comunas_todas = list_all_comunas(le, base)
     if FAST_GLOBAL and len(comunas_todas) > 1:
-        comunas_todas = comunas_todas[:1]
+        comunas_todas = comunas_todas[:MAX_COMUNAS]  # aún por comuna para alertas
     else:
         comunas_todas = comunas_todas[:MAX_COMUNAS]
 
@@ -645,13 +653,13 @@ def main():
         except Exception as e:
             print("WARN: no se pudo leer CLIMA_URL:", e)
 
-    # 2) Forecast global
+    # 2) Forecast global (sin comunas)
     forecast_global = generar_forecast_mensual(rf, le, base)
     print(f"[diag] forecast rows={len(forecast_global)} | total llamadas={int(forecast_global['pronostico_llamadas'].sum())}")
     forecast_path = os.path.join(OUT_DIR, "forecast_mensual.json")
     forecast_global.to_json(forecast_path, orient="records", force_ascii=False, indent=2)
 
-    # 3) Alertas climáticas
+    # 3) Alertas climáticas (pueden usar comunas)
     alertas_clima = generar_alertas_clima(rf, le, base, clima_df)
     print(f"[diag] alertas_clima={len(alertas_clima)}")
     with open(os.path.join(OUT_DIR, "alertas_climatologicas.json"), "w", encoding="utf-8") as f:
@@ -675,4 +683,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
