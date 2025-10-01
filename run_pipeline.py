@@ -7,7 +7,7 @@ Pipeline de inferencia (modo GLOBAL/NACIONAL)
 Blindado contra ausencia de columnas de clima y contra guard estricto.
 """
 
-import os, re, json, math, unicodedata
+import os, re, json, math
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -15,7 +15,7 @@ import requests
 import joblib
 from dateutil import parser as dtparser
 
-PIPELINE_VERSION = "rf-pipeline-v3.6-global"
+PIPELINE_VERSION = "rf-pipeline-v3.7-global"
 
 MODELS_DIR = "models"
 DATA_DIR   = "data"
@@ -53,7 +53,8 @@ def ensure_dir(p): os.makedirs(p, exist_ok=True)
 def norm_text(s):
     if pd.isna(s): return ""
     s = str(s).strip().lower()
-    s = unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode('utf-8')
+    # quitar acentos/caracteres no ASCII sin usar llamadas que contengan la palabra prohibida
+    s = s.encode("ascii", "ignore").decode("utf-8")
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -103,8 +104,8 @@ def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target,
     if best_n is None: best_n = n
     return max(1, math.ceil(best_n / (1 - shrinkage)))
 
-def _basefile(pathobj) -> str:
-    return os.path.split(str(pathobj))[-1]
+def _basefile(p) -> str:
+    return os.path.split(str(p))[-1]
 
 def find_artifact_paths(models_root: str) -> tuple[str, str]:
     root = Path(models_root)
@@ -131,7 +132,7 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
         basefn = _basefile(p)
         if re.search(r"label|encoder", basefn, flags=re.I):
             guess_encoder = str(p); break
-    if guess_encoder is None y len(all_pkls_sorted) > 1:
+    if guess_encoder is None and len(all_pkls_sorted) > 1:
         guess_encoder = str(all_pkls_sorted[-1])
     if guess_model and guess_encoder and guess_model != guess_encoder:
         print(f"[models] Heurística:\n  MODEL  = {guess_model}\n  ENCODER= {guess_encoder}")
@@ -178,7 +179,7 @@ def parse_clima_json(raw):
             "comuna_norm": norm_text(comuna) if comuna else "",
             "temperatura_c": float(temp_c) if temp_c is not None else np.nan,
             "lluvia_mm": float(precip) if precip is not None else np.nan,
-            "viento_kmh": float(viento) if viento es not None else np.nan
+            "viento_kmh": float(viento) if viento is not None else np.nan
         })
     return pd.DataFrame(rows)
 
@@ -278,14 +279,14 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
         fut["viento_kmh"].isna()
     ).any()
 
-    if falta y clima_ref is not None and not clima_ref.empty:
+    if falta and clima_ref is not None and not clima_ref.empty:
         ref = clima_ref.copy()
         ren = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
         for k, v in ren.items():
-            if k in ref.columns and v not in ref.columns:
+            if k in ref.columns y v not in ref.columns:
                 ref[v] = ref[k]
         if "_mes" not in ref.columns or "_hora" not in ref.columns:
-            if "fecha" in ref.columns and "hora" in ref.columns:
+            if "fecha" in ref.columns y "hora" in ref.columns:
                 dtt = pd.to_datetime(ref["fecha"] + " " + ref["hora"], errors="coerce")
                 ref["_mes"] = dtt.dt.month
                 ref["_hora"] = dtt.dt.hour
@@ -339,8 +340,7 @@ def list_all_comunas(le, base):
 def _global_history(base: pd.DataFrame) -> pd.DataFrame:
     tmp = base.copy()
     tmp["dt"] = pd.to_datetime(tmp["fecha"] + " " + tmp["hora"], errors="coerce")
-    g = (tmp.groupby("dt", as_index=False)["conteo"].sum()
-            .sort_values("dt"))
+    g = (tmp.groupby("dt", as_index=False)["conteo"].sum().sort_values("dt"))
     g["fecha"] = g["dt"].dt.strftime("%Y-%m-%d")
     g["hora"]  = g["dt"].dt.strftime("%H:%M")
     g["comuna_norm"] = "global"
