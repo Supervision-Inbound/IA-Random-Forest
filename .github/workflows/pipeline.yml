@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       FAST_GLOBAL:
-        description: "1=predecir y agregar global (rápido) / 0=procesar comunas indicado (lento)"
+        description: "1=global rápido (agrega comunas) / 0=procesa varias comunas"
         default: "1"
         required: true
       MAX_COMUNAS:
-        description: "Límite de comunas a procesar si FAST_GLOBAL=0"
+        description: "Límite de comunas si FAST_GLOBAL=0"
         default: "20"
         required: true
 
@@ -16,42 +16,55 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      PYTHONUTF8: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # Tokens/vars
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Hiperparámetros Erlang C (puedes ajustarlos desde la UI si quieres)
+      CLIMA_URL:  ${{ vars.CLIMA_URL }}
+      TURNOS_URL: ${{ vars.TURNOS_URL }}
+
+      # Parámetros Erlang C (puedes cambiarlos en la UI si quieres)
       SLA_TARGET: "0.9"
       ASA_SECONDS: "20"
       OCCUPANCY_MAX: "0.85"
       SHRINKAGE: "0.30"
-      # URLs opcionales
-      CLIMA_URL: ${{ vars.CLIMA_URL }}
-      TURNOS_URL: ${{ vars.TURNOS_URL }}
-      # Si exiges dataset: "1" (si no está en release, falla)
+
+      # Forzar dataset (1=falla si no está en el release)
       REQUIRE_DATASET: "0"
 
+      # Cosas de Python
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: "Set up Python 3.11"
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: "Install base deps (pip)"
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy scikit-learn joblib python-dateutil requests pyarrow fastparquet
 
-      - name: Prepare dirs
+      - name: "Install jq (para parsear API de releases)"
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: "Prepare dirs"
+        shell: bash
         run: |
           mkdir -p models data out
 
-      # ---------- Descarga de assets del último release ----------
-      - name: Download models.zip from latest Release
+      # ---------- Descarga de assets del último Release ----------
+      - name: "Download models.zip from latest Release"
+        shell: bash
         env:
           REPO: ${{ github.repository }}
         run: |
@@ -69,7 +82,8 @@ jobs:
           echo "Contenido de models/:"
           find models -maxdepth 3 -type f -name "*.pkl" -ls
 
-      - name: Download dataset (parquet) from latest Release
+      - name: "Download dataset (parquet) from latest Release"
+        shell: bash
         env:
           REPO: ${{ github.repository }}
         run: |
@@ -86,27 +100,33 @@ jobs:
             echo "Descargado data/dataset_entrenamiento_llamadas.parquet"
           fi
 
-      # ---------- Guardas para evitar el error del name ----------
-      - name: Show revision & files
+      # ---------- Guardas para evitar el error de name ----------
+      - name: "Show revision & files"
+        shell: bash
         run: |
           echo "Branch: $GITHUB_REF  SHA: $GITHUB_SHA"
           git log -1 --oneline
           ls -la
 
-      - name: Guard: verify _name_ sentinel
+      - name: "Guard: verify _name_ sentinel"
+        shell: bash
         run: |
           set -e
           echo "Últimas líneas de run_pipeline.py:"
           tail -n 14 run_pipeline.py || true
+
           echo "Buscando '_name_'..."
           grep -n "_name_" run_pipeline.py
+
           echo "Buscando typo 'name'..."
           if grep -n "name" run_pipeline.py ; then
             echo "ERROR: Se encontró 'name'. Debe ser '_name_' (doble guion bajo)."
             exit 1
           fi
 
-      - name: Run pipeline
+      # ---------- Ejecutar pipeline ----------
+      - name: "Run pipeline"
+        shell: bash
         env:
           FAST_GLOBAL: ${{ github.event.inputs.FAST_GLOBAL || '1' }}
           MAX_COMUNAS: ${{ github.event.inputs.MAX_COMUNAS || '20' }}
@@ -114,8 +134,10 @@ jobs:
           echo "FAST_GLOBAL=${FAST_GLOBAL}  MAX_COMUNAS=${MAX_COMUNAS}"
           python run_pipeline.py
 
-      - name: Commit JSON outputs
+      # ---------- Commit de salidas ----------
+      - name: "Commit JSON outputs"
         if: always()
+        shell: bash
         run: |
           set -e
           git config user.email "actions@github.com"
