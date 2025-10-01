@@ -672,5 +672,6 @@ def main():
 
     print("OK: JSONs globales generados en 'out/'")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
+
