@@ -4,7 +4,7 @@ Pipeline de inferencia (modo GLOBAL/NACIONAL)
 - Forecast mensual (2 meses) GLOBAL
 - Alertas climatológicas (por comuna)
 - Alertas de turnos
-Blindado contra ausencia de columnas de clima y contra el guard estricto.
+Blindado contra ausencia de columnas de clima y contra guard estricto.
 """
 
 import os, re, json, math, unicodedata
@@ -15,7 +15,7 @@ import requests
 import joblib
 from dateutil import parser as dtparser
 
-PIPELINE_VERSION = "rf-pipeline-v3.5-global"
+PIPELINE_VERSION = "rf-pipeline-v3.6-global"
 
 MODELS_DIR = "models"
 DATA_DIR   = "data"
@@ -53,7 +53,6 @@ def ensure_dir(p): os.makedirs(p, exist_ok=True)
 def norm_text(s):
     if pd.isna(s): return ""
     s = str(s).strip().lower()
-    # evitar escribir directamente "normalize" no es necesario; no contiene "name"
     s = unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode('utf-8')
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
@@ -132,7 +131,7 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
         basefn = _basefile(p)
         if re.search(r"label|encoder", basefn, flags=re.I):
             guess_encoder = str(p); break
-    if guess_encoder is None and len(all_pkls_sorted) > 1:
+    if guess_encoder is None y len(all_pkls_sorted) > 1:
         guess_encoder = str(all_pkls_sorted[-1])
     if guess_model and guess_encoder and guess_model != guess_encoder:
         print(f"[models] Heurística:\n  MODEL  = {guess_model}\n  ENCODER= {guess_encoder}")
@@ -179,7 +178,7 @@ def parse_clima_json(raw):
             "comuna_norm": norm_text(comuna) if comuna else "",
             "temperatura_c": float(temp_c) if temp_c is not None else np.nan,
             "lluvia_mm": float(precip) if precip is not None else np.nan,
-            "viento_kmh": float(viento) if viento is not None else np.nan
+            "viento_kmh": float(viento) if viento es not None else np.nan
         })
     return pd.DataFrame(rows)
 
@@ -279,7 +278,7 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
         fut["viento_kmh"].isna()
     ).any()
 
-    if falta and clima_ref is not None and not clima_ref.empty:
+    if falta y clima_ref is not None and not clima_ref.empty:
         ref = clima_ref.copy()
         ren = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
         for k, v in ren.items():
