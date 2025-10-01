@@ -2,18 +2,16 @@
 """
 Pipeline de inferencia (modo GLOBAL/NACIONAL)
 - Forecast mensual (2 meses) GLOBAL
-- Alertas climatológicas (pueden usar lógica por comuna)
+- Alertas climatológicas (por comuna)
 - Alertas de turnos
-Blindado contra ausencia de columnas de clima.
+Blindado contra ausencia de columnas de clima y contra el guard de 'name'.
 """
 
 # =========================
 # Imports
 # =========================
 import os, re, json, math, unicodedata
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import requests
@@ -21,16 +19,16 @@ import joblib
 from dateutil import parser as dtparser
 
 # =========================
-# Versión (para verificar en logs que corre este archivo)
+# Versión
 # =========================
-PIPELINE_VERSION = "rf-pipeline-v3.3-global"
+PIPELINE_VERSION = "rf-pipeline-v3.4-global"
 
 # =========================
 # Config / Constantes
 # =========================
-MODELS_DIR = "models"            # carpeta donde Actions descomprime models.zip
-DATA_DIR   = "data"              # parquet del release
-OUT_DIR    = "out"               # JSONs de salida
+MODELS_DIR = "models"
+DATA_DIR   = "data"
+OUT_DIR    = "out"
 
 PREFERRED_MODEL_FILE   = "modelo_llamadas_rf.pkl"
 PREFERRED_ENCODER_FILE = "labelencoder_comunas.pkl"
@@ -130,17 +128,17 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     root = Path(models_root)
     if not root.exists():
         raise FileNotFoundError(f"No existe la carpeta de modelos: {models_root}")
-    preferred_model = None
-    preferred_encoder = None
+    prefer_model = None
+    prefer_encoder = None
     for p in root.rglob("*.pkl"):
         basefn = _basefile(p).lower()
         if basefn == PREFERRED_MODEL_FILE.lower():
-            preferred_model = str(p)
+            prefer_model = str(p)
         if basefn == PREFERRED_ENCODER_FILE.lower():
-            preferred_encoder = str(p)
-    if preferred_model and preferred_encoder:
-        print(f"[models] Preferidos:\n  MODEL  = {preferred_model}\n  ENCODER= {preferred_encoder}")
-        return preferred_model, preferred_encoder
+            prefer_encoder = str(p)
+    if prefer_model and prefer_encoder:
+        print(f"[models] Preferidos:\n  MODEL  = {prefer_model}\n  ENCODER= {prefer_encoder}")
+        return prefer_model, prefer_encoder
     all_pkls = list(root.rglob("*.pkl"))
     if not all_pkls:
         raise FileNotFoundError("No se encontraron archivos .pkl dentro de 'models/'.")
@@ -212,7 +210,7 @@ def parse_turnos_json(raw):
         hora   = item.get("hora")
         comuna = item.get("comuna") or item.get("location") or item.get("site")
         agentes= item.get("agentes_planificados") or item.get("agentes") or item.get("personas")
-        if not fecha o r not hora:
+        if not fecha or not hora:
             continue
         rows.append({
             "fecha": fecha,
@@ -314,7 +312,7 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
         ref = clima_ref.copy()
         ren = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
         for k, v in ren.items():
-            if k in ref.columns y v not in ref.columns:
+            if k in ref.columns and v not in ref.columns:
                 ref[v] = ref[k]
         if "_mes" not in ref.columns or "_hora" not in ref.columns:
             if "fecha" in ref.columns and "hora" in ref.columns:
@@ -541,7 +539,6 @@ def generar_forecast_mensual(rf, le, base):
         axis=1
     )
 
-    # <<< patch sin .rename >>>
     out = global_df.copy()
     out["pronostico_llamadas"] = out.pop("llamadas")
     out["tmo"] = out.pop("tmo_segundos")
@@ -549,8 +546,7 @@ def generar_forecast_mensual(rf, le, base):
 
 def generar_alertas_clima(rf, le, base, clima_df):
     start_alert = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
-    comunas_todas = list_all_comunas(le, base)
-    comunas_todas = comunas_todas[:MAX_COMUNAS]
+    comunas_todas = list_all_comunas(le, base)[:MAX_COMUNAS]
 
     pred_clima = predict_iterativo(rf, le, base, clima_df, start_alert, HORIZON_ALERTAS_H, comunas_obj=comunas_todas)
     df_neutro = pd.DataFrame(columns=["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"])
@@ -559,8 +555,7 @@ def generar_alertas_clima(rf, le, base, clima_df):
     g_clima = aggregate_global(pred_clima, y_col="llamadas", tmo_col="tmo_segundos")
     g_base  = aggregate_global(pred_base,  y_col="llamadas", tmo_col="tmo_segundos")
 
-    key = ["fecha","hora"]
-    m = (g_clima.merge(g_base, on=key, suffixes=("_clima","_base")))
+    m = g_clima.merge(g_base, on=["fecha","hora"], suffixes=("_clima","_base"))
 
     alertas = []
     for _, r in m.iterrows():
@@ -590,8 +585,7 @@ def generar_alertas_turnos(forecast_global_df, turnos_df):
     else:
         turnos_g = turnos_df[["fecha","hora","agentes_planificados"]].copy()
 
-    key = ["fecha","hora"]
-    m = (forecast_global_df.merge(turnos_g, on=key, how="left")
+    m = (forecast_global_df.merge(turnos_g, on=["fecha","hora"], how="left")
          .fillna({"agentes_planificados":0}))
     m["faltantes"] = (m["agentes_requeridos"] - m["agentes_planificados"]).clip(lower=0)
 
@@ -616,7 +610,7 @@ def main():
     print(f"[diag] ENV REQUIRE_DATASET={os.environ.get('REQUIRE_DATASET')}")
 
     rf, le, base = load_artifacts()
-    dataset_ok = base is not None y not base.empty
+    dataset_ok = base is not None and not base.empty
     print(f"[diag] dataset loaded: {dataset_ok}")
     if dataset_ok:
         print(f"[diag] dataset rows={len(base)} | cols={list(base.columns)[:10]}...")
