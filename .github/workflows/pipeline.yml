@@ -2,9 +2,8 @@ name: IA Forecast + Alertas
 
 on:
   workflow_dispatch:
-  # Si luego quieres que corra solo, descomenta:
   # schedule:
-  #   - cron: "0 6 * * *"   # todos los días 06:00 UTC
+  #   - cron: "0 6 * * *"   # opcional: ejecutar diario 06:00 UTC
 
 permissions:
   contents: write
@@ -21,7 +20,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'            # ✅ acelera corridas siguientes
+          cache: 'pip'       # ✅ acelera corridas siguientes
 
       - name: Install deps
         run: |
@@ -72,28 +71,38 @@ jobs:
           CLIMA_URL:     ${{ secrets.CLIMA_URL }}
           TURNOS_URL:    ${{ secrets.TURNOS_URL }}
 
-          # Parámetros Erlang C (opcional; si no pones secretos, usa defaults del script)
-          SLA_TARGET:    ${{ secrets.SLA_TARGET }}      # ej. 0.9
-          ASA_SECONDS:   ${{ secrets.ASA_SECONDS }}     # ej. 20
-          OCCUPANCY_MAX: ${{ secrets.OCCUPANCY_MAX }}   # ej. 0.85
-          SHRINKAGE:     ${{ secrets.SHRINKAGE }}       # ej. 0.3
+          # Erlang C (opcional) – si no están, el script usa defaults
+          SLA_TARGET:    ${{ secrets.SLA_TARGET }}
+          ASA_SECONDS:   ${{ secrets.ASA_SECONDS }}
+          OCCUPANCY_MAX: ${{ secrets.OCCUPANCY_MAX }}
+          SHRINKAGE:     ${{ secrets.SHRINKAGE }}
 
-          # ⚡ Performance flags (puedes definirlas como Repository > Variables):
-          FAST_GLOBAL:   ${{ vars.FAST_GLOBAL || '1' }}   # 1 = solo serie global (mucho más rápido)
-          MAX_COMUNAS:   ${{ vars.MAX_COMUNAS || '20' }}  # límite de comunas si FAST_GLOBAL=0
+          # ⚡ Performance y modo nacional:
+          FAST_GLOBAL:   "1"      # 1 = solo serie global
+          MAX_COMUNAS:   "20"     # límite si FAST_GLOBAL=0
 
-          # Forzar que exista el parquet del release:
+          # Exigir parquet (si falta, el run falla – no hay fallback)
           REQUIRE_DATASET: "1"
         run: |
+          echo "FAST_GLOBAL=${FAST_GLOBAL}  MAX_COMUNAS=${MAX_COMUNAS}"
           date
           python run_pipeline.py
           date
+
+      - name: Inspect outputs
+        run: |
+          echo "SHA256 de salidas:"
+          sha256sum out/forecast_mensual.json || true
+          sha256sum out/alertas_climatologicas.json || true
+          sha256sum out/alertas_turnos.json || true
+          echo "--- HEAD forecast_mensual.json ---"
+          head -n 20 out/forecast_mensual.json || true
 
       - name: Commit JSON outputs
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add out/*.json || true
+          git add -A
           git commit -m "chore: actualizar JSONs de forecast/alertas" || echo "Nada que commitear"
           git push
 
