@@ -42,8 +42,8 @@ MIN_UPLIFT_LLAMADAS  = 30
 FAST_GLOBAL = os.environ.get("FAST_GLOBAL", "1") == "1"
 MAX_COMUNAS = int(os.environ.get("MAX_COMUNAS", "20"))
 
-def get_float_env(name: str, default: float) -> float:
-    v = os.environ.get(name)
+def get_float_env(env_name: str, default: float) -> float:
+    v = os.environ.get(env_name)
     try:
         if v is None or str(v).strip() == "":
             return default
@@ -130,10 +130,10 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     preferred_model = None
     preferred_encoder = None
     for p in root.rglob("*.pkl"):
-        name = p.name.lower()
-        if name == PREFERRED_MODEL_NAME.lower():
+        fname = p.name.lower()
+        if fname == PREFERRED_MODEL_NAME.lower():
             preferred_model = str(p)
-        if name == PREFERRED_ENCODER_NAME.lower():
+        if fname == PREFERRED_ENCODER_NAME.lower():
             preferred_encoder = str(p)
     if preferred_model and preferred_encoder:
         print(f"[models] Preferidos:\n  MODEL  = {preferred_model}\n  ENCODER= {preferred_encoder}")
@@ -141,11 +141,12 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     all_pkls = list(root.rglob("*.pkl"))
     if not all_pkls:
         raise FileNotFoundError("No se encontraron archivos .pkl dentro de 'models/'.")
-    all_pkls_sorted = sorted(all_pkls, key=lambda p: p.stat().st_size, reverse=True)
+    all_pkls_sorted = sorted(all_pkls, key=lambda q: q.stat().st_size, reverse=True)
     guess_model = str(all_pkls_sorted[0])
     guess_encoder = None
     for p in all_pkls:
-        if re.search(r"label|encoder", p.name, flags=re.I):
+        pname = p.name
+        if re.search(r"label|encoder", pname, flags=re.I):
             guess_encoder = str(p); break
     if guess_encoder is None and len(all_pkls_sorted) > 1:
         guess_encoder = str(all_pkls_sorted[-1])
