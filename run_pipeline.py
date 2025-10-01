@@ -212,7 +212,7 @@ def parse_turnos_json(raw):
         hora   = item.get("hora")
         comuna = item.get("comuna") or item.get("location") or item.get("site")
         agentes= item.get("agentes_planificados") or item.get("agentes") or item.get("personas")
-        if not fecha or not hora:
+        if not fecha o r not hora:
             continue
         rows.append({
             "fecha": fecha,
@@ -314,7 +314,7 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
         ref = clima_ref.copy()
         ren = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
         for k, v in ren.items():
-            if k in ref.columns and v not in ref.columns:
+            if k in ref.columns y v not in ref.columns:
                 ref[v] = ref[k]
         if "_mes" not in ref.columns or "_hora" not in ref.columns:
             if "fecha" in ref.columns and "hora" in ref.columns:
@@ -541,7 +541,10 @@ def generar_forecast_mensual(rf, le, base):
         axis=1
     )
 
-    out = global_df.rename(columns={"llamadas":"pronostico_llamadas", "tmo_segundos":"tmo"})
+    # <<< patch sin .rename >>>
+    out = global_df.copy()
+    out["pronostico_llamadas"] = out.pop("llamadas")
+    out["tmo"] = out.pop("tmo_segundos")
     return out[["fecha","hora","tmo","pronostico_llamadas","agentes_requeridos"]]
 
 def generar_alertas_clima(rf, le, base, clima_df):
@@ -613,7 +616,7 @@ def main():
     print(f"[diag] ENV REQUIRE_DATASET={os.environ.get('REQUIRE_DATASET')}")
 
     rf, le, base = load_artifacts()
-    dataset_ok = base is not None and not base.empty
+    dataset_ok = base is not None y not base.empty
     print(f"[diag] dataset loaded: {dataset_ok}")
     if dataset_ok:
         print(f"[diag] dataset rows={len(base)} | cols={list(base.columns)[:10]}...")
@@ -663,4 +666,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
