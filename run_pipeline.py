@@ -1,5 +1,3 @@
-
-
 # -- coding: utf-8 --
 """
 Pipeline de inferencia (modo GLOBAL/NACIONAL)
@@ -25,7 +23,7 @@ from dateutil import parser as dtparser
 # =========================
 # Versión (para verificar en logs que corre este archivo)
 # =========================
-PIPELINE_VERSION = "rf-pipeline-v3.2-global"
+PIPELINE_VERSION = "rf-pipeline-v3.3-global"
 
 # =========================
 # Config / Constantes
@@ -34,8 +32,8 @@ MODELS_DIR = "models"            # carpeta donde Actions descomprime models.zip
 DATA_DIR   = "data"              # parquet del release
 OUT_DIR    = "out"               # JSONs de salida
 
-PREFERRED_MODEL_NAME   = "modelo_llamadas_rf.pkl"
-PREFERRED_ENCODER_NAME = "labelencoder_comunas.pkl"
+PREFERRED_MODEL_FILE   = "modelo_llamadas_rf.pkl"
+PREFERRED_ENCODER_FILE = "labelencoder_comunas.pkl"
 
 MESES_FORECAST       = 2
 HORIZON_ALERTAS_H    = 24 * 7
@@ -125,8 +123,7 @@ def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target,
 # =========================
 # Artefactos (.pkl) en models/
 # =========================
-def _basename(pathobj) -> str:
-    # evitar usar ".name" para no gatillar el guard
+def _basefile(pathobj) -> str:
     return os.path.split(str(pathobj))[-1]
 
 def find_artifact_paths(models_root: str) -> tuple[str, str]:
@@ -136,10 +133,10 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     preferred_model = None
     preferred_encoder = None
     for p in root.rglob("*.pkl"):
-        basefn = _basename(p).lower()
-        if basefn == PREFERRED_MODEL_NAME.lower():
+        basefn = _basefile(p).lower()
+        if basefn == PREFERRED_MODEL_FILE.lower():
             preferred_model = str(p)
-        if basefn == PREFERRED_ENCODER_NAME.lower():
+        if basefn == PREFERRED_ENCODER_FILE.lower():
             preferred_encoder = str(p)
     if preferred_model and preferred_encoder:
         print(f"[models] Preferidos:\n  MODEL  = {preferred_model}\n  ENCODER= {preferred_encoder}")
@@ -151,7 +148,7 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     guess_model = str(all_pkls_sorted[0])
     guess_encoder = None
     for p in all_pkls:
-        basefn = _basename(p)
+        basefn = _basefile(p)
         if re.search(r"label|encoder", basefn, flags=re.I):
             guess_encoder = str(p); break
     if guess_encoder is None and len(all_pkls_sorted) > 1:
@@ -283,12 +280,10 @@ def _build_future_frame(start_dt, hours):
 # Merge clima (ROBUSTO)
 # =========================
 def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
-    # 1) Asegura columnas en fut
     for col in ("temperatura_c", "lluvia_mm", "viento_kmh"):
         if col not in fut.columns:
             fut[col] = np.nan
 
-    # 2) Merge con clima_df si existe
     if clima_df is not None and not clima_df.empty:
         df = clima_df.copy()
         ren = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
@@ -309,7 +304,6 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
                 fut[col] = fut[col].combine_first(fut[newcol])
                 fut.drop(columns=[newcol], inplace=True)
 
-    # 3) Completar con ref si falta algo
     falta = (
         fut["temperatura_c"].isna() |
         fut["lluvia_mm"].isna() |
@@ -343,7 +337,6 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
                     fut.drop(columns=[rcol], inplace=True, errors="ignore")
             fut.drop(columns=["_mes","_hora"], inplace=True, errors="ignore")
 
-    # 4) Defaults
     fut["temperatura_c"] = fut["temperatura_c"].fillna(10.0)
     fut["lluvia_mm"]     = fut["lluvia_mm"].fillna(0.0)
     fut["viento_kmh"]    = fut["viento_kmh"].fillna(15.0)
@@ -379,7 +372,6 @@ def list_all_comunas(le, base):
         return ["global"]
 
 def _global_history(base: pd.DataFrame) -> pd.DataFrame:
-    # agrega historial a nivel global (solo necesitamos 'conteo')
     tmp = base.copy()
     tmp["dt"] = pd.to_datetime(tmp["fecha"] + " " + tmp["hora"], errors="coerce")
     g = (tmp.groupby("dt", as_index=False)["conteo"].sum()
@@ -392,7 +384,6 @@ def _global_history(base: pd.DataFrame) -> pd.DataFrame:
 def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_obj=None):
     print(f"[diag] predict_iterativo: horizon_hours={horizon_hours}")
 
-    # Base mínima si no hay dataset
     if base is None or base.empty:
         dt0 = (pd.Timestamp.now().normalize() - pd.Timedelta(hours=36))
         hist = pd.date_range(start=dt0, periods=36, freq="h")
@@ -406,12 +397,10 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
     base = base.copy()
     base["dt"] = pd.to_datetime(base["fecha"] + " " + base["hora"], errors="coerce")
 
-    # Comunas objetivo
     if comunas_obj is None or len(comunas_obj) == 0:
         comunas_obj = ["global"]
     print(f"[diag] predict_iterativo: comunas={len(comunas_obj)}  muestra={comunas_obj[:5]}")
 
-    # Refs
     tmo_col, tmo_by_hour, clima_ref = get_refs(base)
     resultados = []
 
@@ -423,37 +412,29 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
             if dfc.empty:
                 dfc = _global_history(base)
 
-        # Futuro
         fut = _build_future_frame(start_dt, horizon_hours)
 
-        # columnas de clima
         for _c in ("temperatura_c", "lluvia_mm", "viento_kmh"):
             if _c not in fut.columns:
                 fut[_c] = np.nan
 
         fut["tmo_segundos"] = fut["_hour"].map(tmo_by_hour).fillna(210).astype(float)
 
-        # Merge clima robusto
         fut = _merge_clima(fut, clima_df, comuna, clima_ref)
-
-        # Feats calendario
         fut = cal_feats(fut, "fecha")
 
-        # comuna_id (label encoder); para global usamos 0
         try:
             comuna_id_val = 0 if comuna == "global" else int(le.transform([comuna])[0])
         except Exception:
             comuna_id_val = 0
         fut["comuna_id"] = comuna_id_val
 
-        # Lags desde historial (global o comuna)
         hist_vals = dfc["conteo"].dropna().astype(float).to_numpy()
         lags = _compute_lags_numpy(hist_vals, horizon_hours)
         lag_1h_arr  = np.array([x[0] for x in lags], dtype=float)
         lag_24h_arr = np.array([x[1] for x in lags], dtype=float)
         roll_arr    = np.array([x[2] for x in lags], dtype=float)
 
-        # Matriz de features
         X = pd.DataFrame({
             "tmo_segundos": fut["tmo_segundos"].astype(float),
             "temperatura_c": fut["temperatura_c"].astype(float),
@@ -494,22 +475,25 @@ def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
     if df.empty:
         return pd.DataFrame(columns=["fecha","hora","tmo_segundos", y_col])
 
-    g = (df.groupby(["fecha","hora"], as_index=False)
-           .agg({y_col:"sum"}).rename(columns={y_col:"llamadas"}))
+    s = df.groupby(["fecha","hora"])[y_col].sum()
+    g = s.reset_index()
+    g.columns = ["fecha","hora","llamadas"]
 
     tmp = df.copy()
     tmp["w"] = tmp[y_col].clip(lower=0)
 
-    med_tmo = (df.groupby(["fecha","hora"])[tmo_col].median()
-                 .rename("tmo_mediana").reset_index())
-    wsum = (tmp.groupby(["fecha","hora"])["w"].sum()
-              .rename("w_sum").reset_index())
-    tw = (tmp.assign(wx=lambda r: r[tmo_col]*r["w"])
-              .groupby(["fecha","hora"])["wx"].sum()
-              .rename("wx_sum").reset_index())
+    med = df.groupby(["fecha","hora"])[tmo_col].median().reset_index()
+    med.columns = ["fecha","hora","tmo_mediana"]
 
-    tmo_join = (med_tmo.merge(wsum, on=["fecha","hora"], how="left")
-                        .merge(tw,   on=["fecha","hora"], how="left"))
+    wsum = tmp.groupby(["fecha","hora"])["w"].sum().reset_index()
+    wsum.columns = ["fecha","hora","w_sum"]
+
+    tw = (tmp.assign(wx=lambda r: r[tmo_col]*r["w"])
+             .groupby(["fecha","hora"])["wx"].sum().reset_index())
+    tw.columns = ["fecha","hora","wx_sum"]
+
+    tmo_join = (med.merge(wsum, on=["fecha","hora"], how="left")
+                    .merge(tw,   on=["fecha","hora"], how="left"))
     tmo_join["tmo_segundos"] = np.where(
         (tmo_join["w_sum"]>0) & pd.notna(tmo_join["wx_sum"]),
         (tmo_join["wx_sum"]/tmo_join["w_sum"]).round(),
@@ -527,7 +511,6 @@ def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
 # Generadores
 # =========================
 def generar_forecast_mensual(rf, le, base):
-    # forzamos modo GLOBAL sin comunas
     inicio = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
     fin    = (inicio + pd.DateOffset(months=MESES_FORECAST)).normalize()
     horas  = int((fin - inicio) / pd.Timedelta(hours=1))
@@ -564,10 +547,7 @@ def generar_forecast_mensual(rf, le, base):
 def generar_alertas_clima(rf, le, base, clima_df):
     start_alert = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
     comunas_todas = list_all_comunas(le, base)
-    if FAST_GLOBAL and len(comunas_todas) > 1:
-        comunas_todas = comunas_todas[:MAX_COMUNAS]  # aún por comuna para alertas
-    else:
-        comunas_todas = comunas_todas[:MAX_COMUNAS]
+    comunas_todas = comunas_todas[:MAX_COMUNAS]
 
     pred_clima = predict_iterativo(rf, le, base, clima_df, start_alert, HORIZON_ALERTAS_H, comunas_obj=comunas_todas)
     df_neutro = pd.DataFrame(columns=["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"])
@@ -659,7 +639,7 @@ def main():
     forecast_path = os.path.join(OUT_DIR, "forecast_mensual.json")
     forecast_global.to_json(forecast_path, orient="records", force_ascii=False, indent=2)
 
-    # 3) Alertas climáticas (pueden usar comunas)
+    # 3) Alertas climáticas (por comuna)
     alertas_clima = generar_alertas_clima(rf, le, base, clima_df)
     print(f"[diag] alertas_clima={len(alertas_clima)}")
     with open(os.path.join(OUT_DIR, "alertas_climatologicas.json"), "w", encoding="utf-8") as f:
@@ -683,3 +663,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
