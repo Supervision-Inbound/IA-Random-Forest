@@ -640,7 +640,7 @@ def main():
         try:
             clima_raw = fetch_json(CLIMA_URL)
             clima_df = parse_clima_json(clima_raw)
-            print(f"[diag] clima_df rows={len(clima_df)}")
+            print(f("[diag] clima_df rows={len(clima_df)}"))
         except Exception as e:
             print("WARN: no se pudo leer CLIMA_URL:", e)
 
