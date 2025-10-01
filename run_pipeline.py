@@ -4,12 +4,9 @@ Pipeline de inferencia (modo GLOBAL/NACIONAL)
 - Forecast mensual (2 meses) GLOBAL
 - Alertas climatológicas (por comuna)
 - Alertas de turnos
-Blindado contra ausencia de columnas de clima y contra el guard de 'name'.
+Blindado contra ausencia de columnas de clima y contra el guard estricto.
 """
 
-# =========================
-# Imports
-# =========================
 import os, re, json, math, unicodedata
 from pathlib import Path
 import numpy as np
@@ -18,14 +15,8 @@ import requests
 import joblib
 from dateutil import parser as dtparser
 
-# =========================
-# Versión
-# =========================
-PIPELINE_VERSION = "rf-pipeline-v3.4-global"
+PIPELINE_VERSION = "rf-pipeline-v3.5-global"
 
-# =========================
-# Config / Constantes
-# =========================
 MODELS_DIR = "models"
 DATA_DIR   = "data"
 OUT_DIR    = "out"
@@ -40,8 +31,8 @@ MIN_UPLIFT_LLAMADAS  = 30
 FAST_GLOBAL = os.environ.get("FAST_GLOBAL", "1") == "1"
 MAX_COMUNAS = int(os.environ.get("MAX_COMUNAS", "20"))
 
-def get_float_env(envkey: str, default: float) -> float:
-    v = os.environ.get(envkey)
+def get_float_env(key: str, default: float) -> float:
+    v = os.environ.get(key)
     try:
         if v is None or str(v).strip() == "":
             return default
@@ -57,14 +48,12 @@ SHRINKAGE   = get_float_env("SHRINKAGE", 0.3)
 CLIMA_URL  = os.environ.get("CLIMA_URL", "").strip()
 TURNOS_URL = os.environ.get("TURNOS_URL", "").strip()
 
-# =========================
-# Utils
-# =========================
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def norm_text(s):
     if pd.isna(s): return ""
     s = str(s).strip().lower()
+    # evitar escribir directamente "normalize" no es necesario; no contiene "name"
     s = unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode('utf-8')
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
@@ -81,9 +70,6 @@ def cal_feats(df, fecha_col="fecha"):
     df["es_primavera"] = df["mes"].isin([9,10,11]).astype(int)
     return df
 
-# =========================
-# Erlang C / Dotación
-# =========================
 def erlang_c_probability(a, n):
     if n <= 0: return 1.0
     rho = a / n
@@ -118,9 +104,6 @@ def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target,
     if best_n is None: best_n = n
     return max(1, math.ceil(best_n / (1 - shrinkage)))
 
-# =========================
-# Artefactos (.pkl) en models/
-# =========================
 def _basefile(pathobj) -> str:
     return os.path.split(str(pathobj))[-1]
 
@@ -171,9 +154,6 @@ def load_artifacts():
         base = pd.read_parquet(dataset_path)
     return rf, le, base
 
-# =========================
-# Adapters JSON externos
-# =========================
 def fetch_json(url):
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -220,9 +200,6 @@ def parse_turnos_json(raw):
         })
     return pd.DataFrame(rows)
 
-# =========================
-# Referencias si falta dataset
-# =========================
 def build_refs_when_no_dataset():
     tmo_by_hour = {h:210 for h in range(24)}
     clima_ref = pd.DataFrame({
@@ -251,9 +228,6 @@ def get_refs(base: pd.DataFrame|None):
                  [["temperatura_c","lluvia_mm","viento_kmh"]].median().reset_index())
     return tmo_col, tmo_by_hour, clima_ref
 
-# =========================
-# Features
-# =========================
 FEATURES = [
     "tmo_segundos",
     "temperatura_c","lluvia_mm","viento_kmh",
@@ -274,9 +248,6 @@ def _build_future_frame(start_dt, hours):
     })
     return df
 
-# =========================
-# Merge clima (ROBUSTO)
-# =========================
 def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
     for col in ("temperatura_c", "lluvia_mm", "viento_kmh"):
         if col not in fut.columns:
@@ -340,9 +311,6 @@ def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
     fut["viento_kmh"]    = fut["viento_kmh"].fillna(15.0)
     return fut
 
-# =========================
-# Lags + predicción (global o por comuna)
-# =========================
 def _compute_lags_numpy(hist_vals, horizon_len):
     last = hist_vals[-1] if hist_vals.size else 100.0
     yhat = np.zeros(horizon_len, dtype=float)
@@ -466,9 +434,6 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
 
     return pd.concat(resultados, ignore_index=True).sort_values(["comuna","fecha","hora"])
 
-# =========================
-# Agregación Global
-# =========================
 def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
     if df.empty:
         return pd.DataFrame(columns=["fecha","hora","tmo_segundos", y_col])
@@ -505,9 +470,6 @@ def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
     out["llamadas"]     = out["llamadas"].fillna(0).astype(int)
     return out
 
-# =========================
-# Generadores
-# =========================
 def generar_forecast_mensual(rf, le, base):
     inicio = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
     fin    = (inicio + pd.DateOffset(months=MESES_FORECAST)).normalize()
@@ -600,9 +562,6 @@ def generar_alertas_turnos(forecast_global_df, turnos_df):
         })
     return alertas
 
-# =========================
-# Main
-# =========================
 def main():
     ensure_dir(OUT_DIR)
     print(f"[diag] START pipeline | {PIPELINE_VERSION}")
@@ -619,7 +578,6 @@ def main():
         raise RuntimeError("Falta data/dataset_entrenamiento_llamadas.parquet. "
                            "Cárgalo en el release (parquet) o desactiva REQUIRE_DATASET.")
 
-    # 1) Clima
     global clima_df
     clima_df = pd.DataFrame(columns=["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"])
     if CLIMA_URL:
@@ -630,19 +588,16 @@ def main():
         except Exception as e:
             print("WARN: no se pudo leer CLIMA_URL:", e)
 
-    # 2) Forecast global (sin comunas)
     forecast_global = generar_forecast_mensual(rf, le, base)
     print(f"[diag] forecast rows={len(forecast_global)} | total llamadas={int(forecast_global['pronostico_llamadas'].sum())}")
     forecast_path = os.path.join(OUT_DIR, "forecast_mensual.json")
     forecast_global.to_json(forecast_path, orient="records", force_ascii=False, indent=2)
 
-    # 3) Alertas climáticas (por comuna)
     alertas_clima = generar_alertas_clima(rf, le, base, clima_df)
     print(f"[diag] alertas_clima={len(alertas_clima)}")
     with open(os.path.join(OUT_DIR, "alertas_climatologicas.json"), "w", encoding="utf-8") as f:
         json.dump(alertas_clima, f, ensure_ascii=False, indent=2)
 
-    # 4) Alertas de turnos
     alertas_turnos = []
     if TURNOS_URL:
         try:
@@ -660,4 +615,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
