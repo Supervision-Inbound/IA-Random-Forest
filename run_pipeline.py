@@ -1,4 +1,15 @@
 # -- coding: utf-8 --
+"""
+Pipeline de inferencia (modo GLOBAL/NACIONAL)
+- Forecast mensual (2 meses)
+- Alertas climatológicas
+- Alertas de turnos
+Blindado contra ausencia de columnas de clima.
+"""
+
+# =========================
+# Imports
+# =========================
 import os, re, json, math, unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,50 +21,46 @@ import joblib
 from dateutil import parser as dtparser
 
 # =========================
-# CONFIG BÁSICA / CONSTANTES
+# Versión (para verificar en logs que corre este archivo)
 # =========================
-MODELS_DIR = "models"    # donde se descomprime models.zip (Actions lo hace)
-DATA_DIR   = "data"      # aquí debe estar dataset_entrenamiento_llamadas.parquet
-OUT_DIR    = "out"
+PIPELINE_VERSION = "rf-pipeline-v3.1"
 
-# nombres preferidos de artefactos (si no coinciden, se buscarán por heurística)
+# =========================
+# Config / Constantes
+# =========================
+MODELS_DIR = "models"            # carpeta donde Actions descomprime models.zip
+DATA_DIR   = "data"              # parquet del release
+OUT_DIR    = "out"               # JSONs de salida
+
 PREFERRED_MODEL_NAME   = "modelo_llamadas_rf.pkl"
 PREFERRED_ENCODER_NAME = "labelencoder_comunas.pkl"
 
-# horizonte / umbrales
-MESES_FORECAST       = 2       # meses hacia adelante
-HORIZON_ALERTAS_H    = 24 * 7  # 1 semana (horas)
-MIN_UPLIFT_LLAMADAS  = 30      # umbral de alerta climática (uplift)
+MESES_FORECAST       = 2
+HORIZON_ALERTAS_H    = 24 * 7
+MIN_UPLIFT_LLAMADAS  = 30
 
-# flags de performance / modo
 FAST_GLOBAL = os.environ.get("FAST_GLOBAL", "1") == "1"
 MAX_COMUNAS = int(os.environ.get("MAX_COMUNAS", "20"))
 
-# =========================
-# LECTURA ROBUSTA DE ENTORNO
-# =========================
 def get_float_env(name: str, default: float) -> float:
-    """Lee un float desde env; si está vacío o inválido, devuelve default."""
-    val = os.environ.get(name)
+    v = os.environ.get(name)
     try:
-        if val is None or str(val).strip() == "":
+        if v is None or str(v).strip() == "":
             return default
-        return float(val)
+        return float(v)
     except Exception:
         return default
 
-# Erlang C params
-SLA_TARGET  = get_float_env("SLA_TARGET", 0.9)      # 90%
-ASA_SECONDS = get_float_env("ASA_SECONDS", 20.0)   # 20s
-OCC_MAX     = get_float_env("OCCUPANCY_MAX", 0.85) # 85%
-SHRINKAGE   = get_float_env("SHRINKAGE", 0.3)      # 30%
+SLA_TARGET  = get_float_env("SLA_TARGET", 0.9)
+ASA_SECONDS = get_float_env("ASA_SECONDS", 20.0)
+OCC_MAX     = get_float_env("OCCUPANCY_MAX", 0.85)
+SHRINKAGE   = get_float_env("SHRINKAGE", 0.3)
 
-# URLs (pueden venir vacías)
 CLIMA_URL  = os.environ.get("CLIMA_URL", "").strip()
 TURNOS_URL = os.environ.get("TURNOS_URL", "").strip()
 
 # =========================
-# UTILIDADES
+# Utils
 # =========================
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
@@ -70,14 +77,14 @@ def cal_feats(df, fecha_col="fecha"):
     df["mes"]  = dt.dt.month
     df["dia_semana_num"] = dt.dt.dayofweek
     df["es_finde"] = df["dia_semana_num"].isin([5,6]).astype(int)
-    df["es_verano"]     = df["mes"].isin([12,1,2]).astype(int)
-    df["es_otono"]      = df["mes"].isin([3,4,5]).astype(int)
-    df["es_invierno"]   = df["mes"].isin([6,7,8]).astype(int)
-    df["es_primavera"]  = df["mes"].isin([9,10,11]).astype(int)
+    df["es_verano"]    = df["mes"].isin([12,1,2]).astype(int)
+    df["es_otono"]     = df["mes"].isin([3,4,5]).astype(int)
+    df["es_invierno"]  = df["mes"].isin([6,7,8]).astype(int)
+    df["es_primavera"] = df["mes"].isin([9,10,11]).astype(int)
     return df
 
 # =========================
-# ERLANG C / DOTACIÓN
+# Erlang C / Dotación
 # =========================
 def erlang_c_probability(a, n):
     if n <= 0: return 1.0
@@ -93,9 +100,6 @@ def erlang_c_probability(a, n):
 
 def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target,
                     occ_max=0.85, shrinkage=0.3, n_max=2000):
-    """
-    Calcula el número de agentes requeridos usando la fórmula de Erlang C.
-    """
     calls_per_hour = max(0.0, float(calls_per_hour))
     lam = calls_per_hour / 3600.0
     a = lam * max(1.0, float(aht_sec))
@@ -117,7 +121,7 @@ def required_agents(calls_per_hour, aht_sec, asa_target_sec, sla_target,
     return max(1, math.ceil(best_n / (1 - shrinkage)))
 
 # =========================
-# ARTEFACTOS (.pkl) EN models/
+# Artefactos (.pkl) en models/
 # =========================
 def find_artifact_paths(models_root: str) -> tuple[str, str]:
     root = Path(models_root)
@@ -132,7 +136,7 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
         if name == PREFERRED_ENCODER_NAME.lower():
             preferred_encoder = str(p)
     if preferred_model and preferred_encoder:
-        print(f"[models] Preferidos:\n  MODEL   = {preferred_model}\n  ENCODER = {preferred_encoder}")
+        print(f"[models] Preferidos:\n  MODEL  = {preferred_model}\n  ENCODER= {preferred_encoder}")
         return preferred_model, preferred_encoder
     all_pkls = list(root.rglob("*.pkl"))
     if not all_pkls:
@@ -146,17 +150,13 @@ def find_artifact_paths(models_root: str) -> tuple[str, str]:
     if guess_encoder is None and len(all_pkls_sorted) > 1:
         guess_encoder = str(all_pkls_sorted[-1])
     if guess_model and guess_encoder and guess_model != guess_encoder:
-        print(f"[models] Heurística:\n  MODEL   = {guess_model}\n  ENCODER = {guess_encoder}")
+        print(f"[models] Heurística:\n  MODEL  = {guess_model}\n  ENCODER= {guess_encoder}")
         return guess_model, guess_encoder
     raise FileNotFoundError("No pude identificar modelo y encoder dentro de 'models/'.")
 
-# =========================
-# CARGA ARTEFACTOS Y DATASET
-# =========================
 def load_artifacts():
     model_path, encoder_path = find_artifact_paths(MODELS_DIR)
     rf = joblib.load(model_path)
-    # acelera RF si no vino configurado
     try:
         if getattr(rf, "n_jobs", None) in (None, 1):
             rf.n_jobs = -1
@@ -170,7 +170,7 @@ def load_artifacts():
     return rf, le, base
 
 # =========================
-# ADAPTADORES DE JSON EXTERNOS
+# Adapters JSON externos
 # =========================
 def fetch_json(url):
     r = requests.get(url, timeout=30)
@@ -219,7 +219,7 @@ def parse_turnos_json(raw):
     return pd.DataFrame(rows)
 
 # =========================
-# REFERENCIAS SI NO HAY DATASET (fallback)
+# Referencias si falta dataset
 # =========================
 def build_refs_when_no_dataset():
     tmo_by_hour = {h:210 for h in range(24)}
@@ -246,11 +246,11 @@ def get_refs(base: pd.DataFrame|None):
     base["_mes"]  = pd.to_datetime(base["fecha"]).dt.month
     base["_hora"] = base["_hora_int"]
     clima_ref = (base.groupby(["comuna_norm","_mes","_hora"])
-                   [["temperatura_c","lluvia_mm","viento_kmh"]].median().reset_index())
+                 [["temperatura_c","lluvia_mm","viento_kmh"]].median().reset_index())
     return tmo_col, tmo_by_hour, clima_ref
 
 # =========================
-# PREDICCIÓN RÁPIDA (batch)
+# Features
 # =========================
 FEATURES = [
     "tmo_segundos",
@@ -272,101 +272,79 @@ def _build_future_frame(start_dt, hours):
     })
     return df
 
-# ----------- NUEVA VERSIÓN ROBUSTA --------------
+# =========================
+# Merge clima (ROBUSTO)
+# =========================
 def _merge_clima(fut, clima_df, comuna_norm, clima_ref):
-    """
-    Garantiza que fut tenga columnas de clima; si hay clima_df las usa,
-    si faltan valores completa con clima_ref (por _mes/_hora), y finalmente
-    aplica defaults.
-    """
     # 1) Asegura columnas en fut
-    for col in ["temperatura_c", "lluvia_mm", "viento_kmh"]:
+    for col in ("temperatura_c", "lluvia_mm", "viento_kmh"):
         if col not in fut.columns:
             fut[col] = np.nan
 
-    # 2) Si viene clima_df, normaliza y mergea por fecha/hora
+    # 2) Merge con clima_df si existe
     if clima_df is not None and not clima_df.empty:
         df = clima_df.copy()
-
-        # Normaliza posibles nombres alternativos
-        alt = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
-        for k, v in alt.items():
+        ren = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
+        for k, v in ren.items():
             if k in df.columns and v not in df.columns:
                 df[v] = df[k]
-
-        # Asegura columnas mínimas
-        for col in ["fecha", "hora", "temperatura_c", "lluvia_mm", "viento_kmh"]:
+        for col in ("fecha", "hora", "temperatura_c", "lluvia_mm", "viento_kmh"):
             if col not in df.columns:
                 df[col] = np.nan
-
-        # Normaliza hora HH:MM
         df["hora"] = df["hora"].astype(str).str.slice(0, 5)
-
-        # Filtra por comuna si existe
         if "comuna_norm" in df.columns:
             df = df[df["comuna_norm"] == comuna_norm]
-
-        df = df[["fecha", "hora", "temperatura_c", "lluvia_mm", "viento_kmh"]].drop_duplicates()
-
-        # Merge principal
-        fut = fut.merge(df, on=["fecha", "hora"], how="left", suffixes=("", "_new"))
-
-        # Combina columnas nuevas si quedaron con sufijo _new
-        for col in ["temperatura_c", "lluvia_mm", "viento_kmh"]:
+        df = df[["fecha","hora","temperatura_c","lluvia_mm","viento_kmh"]].drop_duplicates()
+        fut = fut.merge(df, on=["fecha","hora"], how="left", suffixes=("", "_new"))
+        for col in ("temperatura_c", "lluvia_mm", "viento_kmh"):
             newcol = f"{col}_new"
             if newcol in fut.columns:
                 fut[col] = fut[col].combine_first(fut[newcol])
                 fut.drop(columns=[newcol], inplace=True)
 
-    # 3) Completa faltantes con clima_ref (por _mes/_hora)
-    need_ref = fut[["temperatura_c", "lluvia_mm", "viento_kmh"]].isna().any(axis=1).any()
-    if need_ref and clima_ref is not None and not clima_ref.empty:
-        ref = clima_ref.copy()
+    # 3) Completar con ref si falta algo
+    falta = (
+        fut["temperatura_c"].isna() |
+        fut["lluvia_mm"].isna() |
+        fut["viento_kmh"].isna()
+    ).any()
 
-        # Normaliza posibles nombres alternativos
-        alt = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
-        for k, v in alt.items():
+    if falta and clima_ref is not None and not clima_ref.empty:
+        ref = clima_ref.copy()
+        ren = {"Temp_C": "temperatura_c", "Precip_mm": "lluvia_mm", "Viento_kmh": "viento_kmh"}
+        for k, v in ren.items():
             if k in ref.columns and v not in ref.columns:
                 ref[v] = ref[k]
-
-        # Intenta construir _mes/_hora si no existen en ref
         if "_mes" not in ref.columns or "_hora" not in ref.columns:
             if "fecha" in ref.columns and "hora" in ref.columns:
                 dtt = pd.to_datetime(ref["fecha"] + " " + ref["hora"], errors="coerce")
                 ref["_mes"] = dtt.dt.month
                 ref["_hora"] = dtt.dt.hour
-
-        # Filtra por comuna si aplica
         if "comuna_norm" in ref.columns:
             ref = ref[ref["comuna_norm"] == comuna_norm]
-
-        # Dejamos solo claves y valores esperados
-        cols_ok = ["_mes", "_hora", "temperatura_c", "lluvia_mm", "viento_kmh"]
+        cols_ok = ["_mes","_hora","temperatura_c","lluvia_mm","viento_kmh"]
         ref = ref[[c for c in cols_ok if c in ref.columns]].drop_duplicates()
-
-        if {"_mes", "_hora"}.issubset(ref.columns):
+        if {"_mes","_hora"}.issubset(ref.columns):
             fut = fut.merge(
-                ref,
-                left_on=["_mes", "_hour"],
-                right_on=["_mes", "_hora"],
-                how="left",
-                suffixes=("", "_ref"),
+                ref, left_on=["_mes","_hour"], right_on=["_mes","_hora"],
+                how="left", suffixes=("", "_ref")
             )
-            for col in ["temperatura_c", "lluvia_mm", "viento_kmh"]:
+            for col in ("temperatura_c", "lluvia_mm", "viento_kmh"):
                 rcol = f"{col}_ref"
                 if rcol in fut.columns:
                     fut[col] = fut[col].fillna(fut[rcol])
                     fut.drop(columns=[rcol], inplace=True, errors="ignore")
-            fut.drop(columns=["_mes_y", "_hora_y", "_mes_ref", "_hora_ref", "_mes", "_hora"], inplace=True, errors="ignore")
+            fut.drop(columns=["_mes","_hora"], inplace=True, errors="ignore")
 
-    # 4) Defaults finales
+    # 4) Defaults
     fut["temperatura_c"] = fut["temperatura_c"].fillna(10.0)
     fut["lluvia_mm"]     = fut["lluvia_mm"].fillna(0.0)
     fut["viento_kmh"]    = fut["viento_kmh"].fillna(15.0)
-
     return fut
-# ------------------------------------------------
 
+# =========================
+# Lags + predicción iterativa
+# =========================
 def _compute_lags_numpy(hist_vals, horizon_len):
     last = hist_vals[-1] if hist_vals.size else 100.0
     yhat = np.zeros(horizon_len, dtype=float)
@@ -385,8 +363,17 @@ def _compute_lags_numpy(hist_vals, horizon_len):
         lags.append((l1, l24, rmean))
     return lags
 
+def list_all_comunas(le, base):
+    if base is not None and "comuna_norm" in base.columns and not base["comuna_norm"].dropna().empty:
+        return sorted(base["comuna_norm"].dropna().unique().tolist())
+    try:
+        return sorted([str(c) for c in le.classes_])
+    except Exception:
+        return ["global"]
+
 def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_obj=None):
     print(f"[diag] predict_iterativo: horizon_hours={horizon_hours}")
+
     # Base mínima si no hay dataset
     if base is None or base.empty:
         dt0 = (pd.Timestamp.now().normalize() - pd.Timedelta(hours=36))
@@ -397,13 +384,14 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
             "comuna_norm": ["global"]*len(hist),
             "conteo": np.maximum(0, np.round(100 + 30*np.sin(np.linspace(0, 3.14, len(hist)))))
         })
+
     base = base.copy()
     base["dt"] = pd.to_datetime(base["fecha"] + " " + base["hora"], errors="coerce")
 
-    # Comunas
+    # Comunas objetivo
     if comunas_obj is None or len(comunas_obj) == 0:
         mc = (base.groupby("comuna_norm")["conteo"].sum()
-                      .sort_values(ascending=False).index[0])
+                    .sort_values(ascending=False).index[0])
         comunas_obj = [mc]
     if FAST_GLOBAL and len(comunas_obj) > 1:
         comunas_obj = comunas_obj[:1]
@@ -413,8 +401,8 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
 
     # Refs
     tmo_col, tmo_by_hour, clima_ref = get_refs(base)
-
     resultados = []
+
     for comuna in comunas_obj:
         dfc = base[base["comuna_norm"] == comuna].copy().sort_values("dt")
         if dfc.empty:
@@ -422,11 +410,21 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
 
         # Futuro
         fut = _build_future_frame(start_dt, horizon_hours)
+
+        # 🔒 Blindaje: crea columnas de clima ANTES de todo
+        for _c in ("temperatura_c", "lluvia_mm", "viento_kmh"):
+            if _c not in fut.columns:
+                fut[_c] = np.nan
+
         fut["tmo_segundos"] = fut["_hour"].map(tmo_by_hour).fillna(210).astype(float)
+
+        # Merge clima robusto
         fut = _merge_clima(fut, clima_df, comuna, clima_ref)
+
+        # Feats de calendario
         fut = cal_feats(fut, "fecha")
 
-        # comuna_id
+        # comuna_id (label encoder)
         try:
             comuna_id = int(le.transform([comuna])[0])
         except Exception:
@@ -436,14 +434,14 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
                 comuna_id = 0
         fut["comuna_id"] = comuna_id
 
-        # Lags + batch
+        # Lags
         hist_vals = dfc["conteo"].dropna().astype(float).to_numpy()
         lags = _compute_lags_numpy(hist_vals, horizon_hours)
         lag_1h_arr  = np.array([x[0] for x in lags], dtype=float)
         lag_24h_arr = np.array([x[1] for x in lags], dtype=float)
         roll_arr    = np.array([x[2] for x in lags], dtype=float)
 
-        # Matriz de features en el orden FEATURES
+        # Matriz de features
         X = pd.DataFrame({
             "tmo_segundos": fut["tmo_segundos"].astype(float),
             "temperatura_c": fut["temperatura_c"].astype(float),
@@ -478,7 +476,7 @@ def predict_iterativo(rf, le, base, clima_df, start_dt, horizon_hours, comunas_o
     return pd.concat(resultados, ignore_index=True).sort_values(["comuna","fecha","hora"])
 
 # =========================
-# AGREGACIÓN A NIVEL GLOBAL
+# Agregación Global
 # =========================
 def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
     if df.empty:
@@ -489,15 +487,17 @@ def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
 
     tmp = df.copy()
     tmp["w"] = tmp[y_col].clip(lower=0)
+
     med_tmo = (df.groupby(["fecha","hora"])[tmo_col].median()
-               .rename("tmo_mediana").reset_index())
+                 .rename("tmo_mediana").reset_index())
     wsum = (tmp.groupby(["fecha","hora"])["w"].sum()
-               .rename("w_sum").reset_index())
+              .rename("w_sum").reset_index())
     tw = (tmp.assign(wx=lambda r: r[tmo_col]*r["w"])
-               .groupby(["fecha","hora"])["wx"].sum()
-               .rename("wx_sum").reset_index())
+              .groupby(["fecha","hora"])["wx"].sum()
+              .rename("wx_sum").reset_index())
+
     tmo_join = (med_tmo.merge(wsum, on=["fecha","hora"], how="left")
-                       .merge(tw,   on=["fecha","hora"], how="left"))
+                        .merge(tw,   on=["fecha","hora"], how="left"))
     tmo_join["tmo_segundos"] = np.where(
         (tmo_join["w_sum"]>0) & pd.notna(tmo_join["wx_sum"]),
         (tmo_join["wx_sum"]/tmo_join["w_sum"]).round(),
@@ -511,19 +511,10 @@ def aggregate_global(df, y_col="llamadas", tmo_col="tmo_segundos"):
     out["llamadas"]     = out["llamadas"].fillna(0).astype(int)
     return out
 
-def list_all_comunas(le, base):
-    if base is not None and "comuna_norm" in base.columns and not base["comuna_norm"].dropna().empty:
-        return sorted(base["comuna_norm"].dropna().unique().tolist())
-    try:
-        return sorted([str(c) for c in le.classes_])
-    except Exception:
-        return ["global"]
-
 # =========================
-# GENERADORES (GLOBAL)
+# Generadores (GLOBAL)
 # =========================
 def generar_forecast_mensual(rf, le, base):
-    """Genera el pronóstico global de llamadas y agentes para los próximos MESES_FORECAST."""
     inicio = (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
     fin    = (inicio + pd.DateOffset(months=MESES_FORECAST)).normalize()
     horas  = int((fin - inicio) / pd.Timedelta(hours=1))
@@ -534,21 +525,22 @@ def generar_forecast_mensual(rf, le, base):
     else:
         comunas_todas = comunas_todas[:MAX_COMUNAS]
     print(f"[diag] comunas para predicción: {len(comunas_todas)}  muestra={comunas_todas[:5]}")
-    
-    # Para el forecast mensual, usamos un clima "neutro" o de referencia.
-    # Por eso pasamos un DataFrame vacío, para que la predicción use los promedios históricos.
-    clima_df_vacio = pd.DataFrame()
+
+    clima_cols = ["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"]
+    try:
+        _clima_df = clima_df if 'clima_df' in globals() else pd.DataFrame(columns=clima_cols)
+    except NameError:
+        _clima_df = pd.DataFrame(columns=clima_cols)
 
     pred_per_comuna = predict_iterativo(
         rf, le, base,
-        clima_df=clima_df_vacio,
+        clima_df=_clima_df,
         start_dt=inicio,
         horizon_hours=horas,
         comunas_obj=comunas_todas
     )
 
     global_df = aggregate_global(pred_per_comuna, y_col="llamadas", tmo_col="tmo_segundos")
-
     global_df["agentes_requeridos"] = global_df.apply(
         lambda r: required_agents(
             r["llamadas"], r["tmo_segundos"],
@@ -556,6 +548,7 @@ def generar_forecast_mensual(rf, le, base):
         ),
         axis=1
     )
+
     out = global_df.rename(columns={"llamadas":"pronostico_llamadas", "tmo_segundos":"tmo"})
     return out[["fecha","hora","tmo","pronostico_llamadas","agentes_requeridos"]]
 
@@ -601,13 +594,13 @@ def generar_alertas_clima(rf, le, base, clima_df):
 def generar_alertas_turnos(forecast_global_df, turnos_df):
     if "comuna_norm" in turnos_df.columns:
         turnos_g = (turnos_df.groupby(["fecha","hora"], as_index=False)
-                       .agg({"agentes_planificados":"sum"}))
+                    .agg({"agentes_planificados":"sum"}))
     else:
         turnos_g = turnos_df[["fecha","hora","agentes_planificados"]].copy()
 
     key = ["fecha","hora"]
     m = (forecast_global_df.merge(turnos_g, on=key, how="left")
-           .fillna({"agentes_planificados":0}))
+         .fillna({"agentes_planificados":0}))
     m["faltantes"] = (m["agentes_requeridos"] - m["agentes_planificados"]).clip(lower=0)
 
     alertas = []
@@ -622,13 +615,14 @@ def generar_alertas_turnos(forecast_global_df, turnos_df):
     return alertas
 
 # =========================
-# MAIN
+# Main
 # =========================
 def main():
     ensure_dir(OUT_DIR)
-    print("[diag] START pipeline")
+    print(f"[diag] START pipeline | {PIPELINE_VERSION}")
     print(f"[diag] ENV FAST_GLOBAL={FAST_GLOBAL}  MAX_COMUNAS={MAX_COMUNAS}")
     print(f"[diag] ENV REQUIRE_DATASET={os.environ.get('REQUIRE_DATASET')}")
+
     rf, le, base = load_artifacts()
     dataset_ok = base is not None and not base.empty
     print(f"[diag] dataset loaded: {dataset_ok}")
@@ -639,29 +633,30 @@ def main():
         raise RuntimeError("Falta data/dataset_entrenamiento_llamadas.parquet. "
                            "Cárgalo en el release (parquet) o desactiva REQUIRE_DATASET.")
 
-    # 1) Clima (si hay URL)
-    clima_df = pd.DataFrame()
+    # 1) Clima
+    global clima_df
+    clima_df = pd.DataFrame(columns=["fecha","hora","comuna_norm","temperatura_c","lluvia_mm","viento_kmh"])
     if CLIMA_URL:
         try:
             clima_raw = fetch_json(CLIMA_URL)
             clima_df = parse_clima_json(clima_raw)
             print(f"[diag] clima_df rows={len(clima_df)}")
         except Exception as e:
-            print(f"WARN: no se pudo leer CLIMA_URL: {e}")
+            print("WARN: no se pudo leer CLIMA_URL:", e)
 
-    # 2) Forecast global (2 meses)
+    # 2) Forecast global
     forecast_global = generar_forecast_mensual(rf, le, base)
     print(f"[diag] forecast rows={len(forecast_global)} | total llamadas={int(forecast_global['pronostico_llamadas'].sum())}")
     forecast_path = os.path.join(OUT_DIR, "forecast_mensual.json")
     forecast_global.to_json(forecast_path, orient="records", force_ascii=False, indent=2)
 
-    # 3) Alertas climáticas (global)
+    # 3) Alertas climáticas
     alertas_clima = generar_alertas_clima(rf, le, base, clima_df)
     print(f"[diag] alertas_clima={len(alertas_clima)}")
     with open(os.path.join(OUT_DIR, "alertas_climatologicas.json"), "w", encoding="utf-8") as f:
         json.dump(alertas_clima, f, ensure_ascii=False, indent=2)
 
-    # 4) Alertas de turnos (global)
+    # 4) Alertas de turnos
     alertas_turnos = []
     if TURNOS_URL:
         try:
@@ -670,13 +665,12 @@ def main():
             print(f"[diag] turnos_df rows={len(df_turnos)}")
             alertas_turnos = generar_alertas_turnos(forecast_global, df_turnos)
         except Exception as e:
-            print(f"WARN: no se pudo leer TURNOS_URL: {e}")
+            print("WARN: no se pudo leer TURNOS_URL:", e)
     print(f"[diag] alertas_turnos={len(alertas_turnos)}")
     with open(os.path.join(OUT_DIR, "alertas_turnos.json"), "w", encoding="utf-8") as f:
         json.dump(alertas_turnos, f, ensure_ascii=False, indent=2)
 
     print("OK: JSONs globales generados en 'out/'")
 
-# CORRECCIÓN CRÍTICA: Usar dos guiones bajos
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
